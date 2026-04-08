@@ -127,7 +127,6 @@ class OrchestratorAgent:
         )
 
         # continue workflow sequence
-        workflow.add_edge("compliance_validation", "await_human_approval")
         workflow.add_edge("await_human_approval", "execute_actions")
         workflow.add_edge("execute_actions", "send_notifications")
         workflow.add_edge("send_notifications", END)
