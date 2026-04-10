@@ -435,7 +435,8 @@ def _row_to_window(row) -> WindowRisk:
 
 def _load_audit_records() -> List[dict]:
     records = []
-    for path in sorted(AUDIT_DIR.glob("audit_*.jsonl")):
+    all_paths = sorted(AUDIT_DIR.glob("audit_*.jsonl")) + sorted(AUDIT_DIR.glob("compliance_events.jsonl"))
+    for path in all_paths:
         with open(path) as f:
             for line in f:
                 line = line.strip()
