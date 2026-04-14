@@ -262,6 +262,61 @@ async def decide_approval(approval_id: str, body: ApprovalDecision):
 _orchestrator_history: List[Dict[str, Any]] = []
 
 
+# ── Triage ───────────────────────────────────────────────────────────────
+
+@app.get("/api/triage/critical-shipments")
+def triage_critical_shipments(limit: int = Query(20, le=100)):
+    """
+    Pull all CRITICAL and HIGH shipments from scored data, run triage ranking,
+    and return priority-ordered list with real excursion context.
+
+    This is the pre-orchestration step — use recommended_orchestration_order
+    to decide which window IDs to pass to /api/orchestrator/run-batch.
+    """
+    df = _get_df()
+
+    # Get the worst window per shipment for CRITICAL and HIGH tiers
+    at_risk = df[df["risk_tier"].isin(["CRITICAL", "HIGH"])]
+    if at_risk.empty:
+        return {"tool": "triage_agent", "status": "no_action_needed", "total_shipments": 0, "priority_list": []}
+
+    # One row per shipment — the highest-scoring window
+    worst_per_shipment = (
+        at_risk.sort_values("final_score", ascending=False)
+        .drop_duplicates(subset=["shipment_id"])
+        .head(limit)
+    )
+
+    shipments_input = [
+        {
+            "shipment_id": str(row["shipment_id"]),
+            "risk_tier": str(row["risk_tier"]),
+            "fused_risk_score": float(row["final_score"]),
+            "product_id": str(row["product_id"]),
+            "container_id": str(row.get("container_id", "")),
+            "transit_phase": str(row.get("transit_phase", "")),
+        }
+        for _, row in worst_per_shipment.iterrows()
+    ]
+
+    from tools.triage_agent import _execute as triage_execute
+    result = triage_execute(shipments=shipments_input, enrich=True)
+    return result
+
+
+@app.post("/api/triage/rank")
+async def triage_rank(shipments: List[Dict[str, Any]]):
+    """
+    Rank a caller-supplied list of shipment dicts by urgency.
+    Each dict must have: shipment_id, risk_tier, fused_risk_score, product_id.
+    container_id and transit_phase are optional.
+    """
+    from tools.triage_agent import _execute as triage_execute
+    result = triage_execute(shipments=shipments, enrich=True)
+    await _broadcast({"type": "triage_completed", "result": result})
+    return result
+
+
 @app.post("/api/orchestrator/run/{window_id}")
 async def orchestrate_window(window_id: str):
     """Feed a window's risk output through the full orchestration agent."""
