@@ -8,8 +8,8 @@ try:
     from .mock_vector_store import MockComplianceVectorStore
 except ImportError:
     # Fallback for direct execution
-    from embeddings import EmbeddingGenerator
-    from mock_vector_store import MockComplianceVectorStore
+    from tools.helper.embeddings import EmbeddingGenerator
+    from tools.helper.mock_vector_store import MockComplianceVectorStore
 
 class ComplianceVectorStore:
     # manage compliance knowledge in Supabase pgvector or mock store

@@ -51,14 +51,7 @@ class ComplianceDocumentParser:
         return text.strip()
     
     def _split_into_sections(self, text: str, metadata: Dict) -> List[Dict]:
-        """
-        Split document into sections based on headers
-        
-        Detects patterns like:
-        - "Section 5.2.3"
-        - "5.2.3 Temperature Control"
-        - "SECTION 5: QUALITY MANAGEMENT"
-        """
+        # split the text into sections based on headers
         sections = []
         
         # Regex patterns for section headers

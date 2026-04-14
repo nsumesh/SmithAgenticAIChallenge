@@ -12,17 +12,9 @@ load_dotenv()
 # Add backend to path for proper imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from supabase import create_client, Client
+from tools.helper.document_parser import ComplianceDocumentParser
+from tools.helper.vector_store import ComplianceVectorStore
 
-
-# Try relative imports first (when imported as module), then absolute imports (when run directly)
-try:
-    from .document_parser import ComplianceDocumentParser
-    from .vector_store import ComplianceVectorStore
-except ImportError:
-    # Fallback for direct execution
-    sys.path.insert(0, str(Path(__file__).parent))
-    from document_parser import ComplianceDocumentParser
-    from vector_store import ComplianceVectorStore
 
 # document metadata (maps to files in Supabase Storage)
 DOCUMENTS = [
