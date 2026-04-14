@@ -1,0 +1,279 @@
+{
+  "P01": {
+    "product_name": "Standard Vaccine",
+    "regulatory_class": "Prescription (POM)",
+    "cold_chain_category": "refrigerated",
+    "who_atc_code": "J07",
+    "therapeutic_area": "Immunisation / Infectious Disease Prevention",
+    "_comment": "Top-level cost fields kept flat for backward-compat with insurance_agent and nodes.py",
+    "unit_cost_usd": 45.00,
+    "units_per_shipment": 500,
+    "currency": "USD",
+    "shipment_value_usd": 22500.00,
+    "cost_components": {
+      "handling_cost_per_shipment_usd": 320.00,
+      "disposal_cost_per_unit_usd": 3.50,
+      "testing_cost_per_batch_usd": 850.00,
+      "regulatory_release_cost_usd": 600.00,
+      "emergency_resupply_surcharge_usd": 2800.00
+    },
+    "downstream_impact": {
+      "downstream_disruption_per_appointment_usd": 280.00,
+      "disruption_description": "Missed immunisation appointment, patient recall, GP admin overhead",
+      "critical_patient_segments": [
+        "paediatric",
+        "immunocompromised",
+        "elderly_seasonal"
+      ]
+    },
+    "replacement": {
+      "lead_time_days": 21,
+      "expedited_lead_time_days": 10,
+      "expedited_premium_pct": 35,
+      "substitute_available": false,
+      "substitute_notes": "Batch-specific lot numbers required for traceability; no direct substitute"
+    },
+    "product_characteristics": {
+      "shelf_life_days": 180,
+      "batch_size_units": 500,
+      "requires_patient_specific_prep": false,
+      "controlled_substance": false,
+      "serialization_required": true,
+      "biological_product": true,
+      "cold_chain_risk_multiplier": 1.2,
+      "regulatory_body": "MHRA / EMA",
+      "storage_condition_label": "Store at 2-8°C. Do not freeze."
+    }
+  },
+  "P02": {
+    "product_name": "Monoclonal Antibody",
+    "regulatory_class": "Prescription (POM) — Biologic",
+    "cold_chain_category": "refrigerated",
+    "who_atc_code": "L04AB",
+    "therapeutic_area": "Oncology / Immunology",
+    "unit_cost_usd": 850.00,
+    "units_per_shipment": 200,
+    "currency": "USD",
+    "shipment_value_usd": 170000.00,
+    "cost_components": {
+      "handling_cost_per_shipment_usd": 1800.00,
+      "disposal_cost_per_unit_usd": 12.00,
+      "testing_cost_per_batch_usd": 4200.00,
+      "regulatory_release_cost_usd": 2500.00,
+      "emergency_resupply_surcharge_usd": 18000.00
+    },
+    "downstream_impact": {
+      "downstream_disruption_per_appointment_usd": 2400.00,
+      "disruption_description": "Cancelled oncology infusion; patient re-staging, clinical risk, potential disease progression, consultant time",
+      "critical_patient_segments": [
+        "active_chemotherapy",
+        "post_transplant",
+        "autoimmune_maintenance"
+      ]
+    },
+    "replacement": {
+      "lead_time_days": 45,
+      "expedited_lead_time_days": 22,
+      "expedited_premium_pct": 55,
+      "substitute_available": false,
+      "substitute_notes": "Biosimilar may be considered at prescriber discretion; requires prior authorisation"
+    },
+    "product_characteristics": {
+      "shelf_life_days": 730,
+      "batch_size_units": 200,
+      "requires_patient_specific_prep": false,
+      "controlled_substance": false,
+      "serialization_required": true,
+      "biological_product": true,
+      "cold_chain_risk_multiplier": 1.5,
+      "regulatory_body": "EMA / FDA",
+      "storage_condition_label": "Store at 2-8°C. Do not freeze. Protect from light."
+    }
+  },
+  "P03": {
+    "product_name": "CRT Pharmaceutical",
+    "regulatory_class": "Prescription (POM)",
+    "cold_chain_category": "controlled_room_temperature",
+    "who_atc_code": "N06",
+    "therapeutic_area": "Neurology / General Medicine",
+    "unit_cost_usd": 15.00,
+    "units_per_shipment": 1000,
+    "currency": "USD",
+    "shipment_value_usd": 15000.00,
+    "cost_components": {
+      "handling_cost_per_shipment_usd": 180.00,
+      "disposal_cost_per_unit_usd": 2.00,
+      "testing_cost_per_batch_usd": 420.00,
+      "regulatory_release_cost_usd": 350.00,
+      "emergency_resupply_surcharge_usd": 1200.00
+    },
+    "downstream_impact": {
+      "downstream_disruption_per_appointment_usd": 95.00,
+      "disruption_description": "Delayed dispensing, GP prescription reissue, patient inconvenience; low clinical urgency for most indications",
+      "critical_patient_segments": [
+        "epilepsy",
+        "psychiatric_maintenance",
+        "pain_management"
+      ]
+    },
+    "replacement": {
+      "lead_time_days": 7,
+      "expedited_lead_time_days": 3,
+      "expedited_premium_pct": 20,
+      "substitute_available": true,
+      "substitute_notes": "Generic equivalent typically available from alternative suppliers within 3 days"
+    },
+    "product_characteristics": {
+      "shelf_life_days": 1095,
+      "batch_size_units": 1000,
+      "requires_patient_specific_prep": false,
+      "controlled_substance": false,
+      "serialization_required": true,
+      "biological_product": false,
+      "cold_chain_risk_multiplier": 1.0,
+      "regulatory_body": "EMA / MHRA",
+      "storage_condition_label": "Store below 25°C in a dry place. Protect from light."
+    }
+  },
+  "P04": {
+    "product_name": "Cryogenic Biologic",
+    "regulatory_class": "Prescription (POM) — Advanced Therapy Medicinal Product (ATMP)",
+    "cold_chain_category": "ultra_low_temperature",
+    "who_atc_code": "L01XY",
+    "therapeutic_area": "Gene Therapy / Oncology",
+    "unit_cost_usd": 3800.00,
+    "units_per_shipment": 50,
+    "currency": "USD",
+    "shipment_value_usd": 190000.00,
+    "cost_components": {
+      "handling_cost_per_shipment_usd": 4500.00,
+      "disposal_cost_per_unit_usd": 85.00,
+      "testing_cost_per_batch_usd": 12000.00,
+      "regulatory_release_cost_usd": 8500.00,
+      "emergency_resupply_surcharge_usd": 45000.00
+    },
+    "downstream_impact": {
+      "downstream_disruption_per_appointment_usd": 8500.00,
+      "disruption_description": "Cancelled gene therapy or CAR-T infusion; patient conditioning may need to be reversed (additional hospitalisation), disease window risk, clinical team reallocation",
+      "critical_patient_segments": [
+        "gene_therapy_candidates",
+        "CAR_T_patients",
+        "haematology_oncology"
+      ]
+    },
+    "replacement": {
+      "lead_time_days": 90,
+      "expedited_lead_time_days": 60,
+      "expedited_premium_pct": 80,
+      "substitute_available": false,
+      "substitute_notes": "No substitute. Batch is patient-specific in many cases. New manufacturing run required."
+    },
+    "product_characteristics": {
+      "shelf_life_days": 365,
+      "batch_size_units": 50,
+      "requires_patient_specific_prep": true,
+      "controlled_substance": false,
+      "serialization_required": true,
+      "biological_product": true,
+      "cold_chain_risk_multiplier": 2.5,
+      "regulatory_body": "EMA (ATMP) / FDA (BLA)",
+      "storage_condition_label": "Store at -20°C or below. Single thaw only. Do not refreeze.",
+      "chain_of_identity_required": true,
+      "haemovigilance_reporting": false,
+      "patient_matching_required": true
+    }
+  },
+  "P05": {
+    "product_name": "Specialty Biologic",
+    "regulatory_class": "Prescription (POM) — Biologic / REMS",
+    "cold_chain_category": "refrigerated",
+    "who_atc_code": "H01AC",
+    "therapeutic_area": "Endocrinology / Rare Disease",
+    "unit_cost_usd": 380.00,
+    "units_per_shipment": 150,
+    "currency": "USD",
+    "shipment_value_usd": 57000.00,
+    "cost_components": {
+      "handling_cost_per_shipment_usd": 650.00,
+      "disposal_cost_per_unit_usd": 18.00,
+      "testing_cost_per_batch_usd": 2800.00,
+      "regulatory_release_cost_usd": 1400.00,
+      "emergency_resupply_surcharge_usd": 9500.00
+    },
+    "downstream_impact": {
+      "downstream_disruption_per_appointment_usd": 1200.00,
+      "disruption_description": "Missed injection appointment for growth hormone or chronic biologic therapy; endocrinology follow-up, dose recalculation, patient anxiety, potential growth setback in paediatric patients",
+      "critical_patient_segments": [
+        "paediatric_growth_disorder",
+        "adult_GH_deficiency",
+        "rare_disease_maintenance"
+      ]
+    },
+    "replacement": {
+      "lead_time_days": 30,
+      "expedited_lead_time_days": 14,
+      "expedited_premium_pct": 45,
+      "substitute_available": false,
+      "substitute_notes": "REMS-programme product; prescriber must be registered. No direct substitute for rare disease indications."
+    },
+    "product_characteristics": {
+      "shelf_life_days": 540,
+      "batch_size_units": 150,
+      "requires_patient_specific_prep": false,
+      "controlled_substance": false,
+      "serialization_required": true,
+      "biological_product": true,
+      "cold_chain_risk_multiplier": 1.8,
+      "regulatory_body": "FDA (REMS) / EMA",
+      "storage_condition_label": "Store at 2-8°C. Do not freeze. Use within 28 days of opening.",
+      "rems_enrolled_prescribers_only": true
+    }
+  },
+  "P06": {
+    "product_name": "Plasma Derivative",
+    "regulatory_class": "Prescription (POM) — Blood Product",
+    "cold_chain_category": "refrigerated",
+    "who_atc_code": "B02BD",
+    "therapeutic_area": "Haematology / Immunology",
+    "unit_cost_usd": 210.00,
+    "units_per_shipment": 120,
+    "currency": "USD",
+    "shipment_value_usd": 25200.00,
+    "cost_components": {
+      "handling_cost_per_shipment_usd": 480.00,
+      "disposal_cost_per_unit_usd": 22.00,
+      "testing_cost_per_batch_usd": 1800.00,
+      "regulatory_release_cost_usd": 950.00,
+      "emergency_resupply_surcharge_usd": 6500.00
+    },
+    "downstream_impact": {
+      "downstream_disruption_per_appointment_usd": 750.00,
+      "disruption_description": "Delayed IVIG infusion, albumin administration, or clotting factor replacement; haematology outpatient cancellation, bleeding risk for coagulation patients, hospital bed days",
+      "critical_patient_segments": [
+        "primary_immunodeficiency",
+        "haemophilia",
+        "critical_care_albumin"
+      ]
+    },
+    "replacement": {
+      "lead_time_days": 14,
+      "expedited_lead_time_days": 5,
+      "expedited_premium_pct": 40,
+      "substitute_available": true,
+      "substitute_notes": "Alternative plasma fractionation batches may be sourced from regional blood services. Haemovigilance traceability must be maintained."
+    },
+    "product_characteristics": {
+      "shelf_life_days": 730,
+      "batch_size_units": 120,
+      "requires_patient_specific_prep": false,
+      "controlled_substance": false,
+      "serialization_required": true,
+      "biological_product": true,
+      "cold_chain_risk_multiplier": 1.4,
+      "regulatory_body": "FDA (BLA) / EMA (ATMP exempt)",
+      "storage_condition_label": "Store at 2-8°C. Do not freeze. Use immediately once thawed.",
+      "haemovigilance_reporting_required": true,
+      "donor_traceability_required": true
+    }
+  }
+}

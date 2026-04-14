@@ -50,7 +50,7 @@ from dotenv import load_dotenv
 load_dotenv()
 sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
-# All risk scores
+<!-- All risk scores -->
 results = sb.table("risk_scores").select("*").execute()
 
 for row in results.data:

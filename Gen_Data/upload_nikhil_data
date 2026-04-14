@@ -1,0 +1,102 @@
+# upload_nikhil_data.py
+import json, os
+from supabase import create_client
+from dotenv import load_dotenv
+
+load_dotenv()
+sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+
+# ── Load JSON files ────────────────────────────────────────────
+with open("Gen_Data\product_profiles.json") as f:
+    profiles = json.load(f)
+
+with open("Gen_Data\product_costs.json") as f:
+    costs = json.load(f)
+
+with open("Gen_Data\\facilities.json") as f:
+    facilities = json.load(f)
+
+
+# ── 1. product_profiles (fully flat) ──────────────────────────
+profile_rows = []
+for pid, d in profiles.items():
+    profile_rows.append({
+        "product_id":         pid,
+        "name":               d["name"],
+        "category":           d["category"],
+        "temp_low":           d["temp_low"],
+        "temp_high":          d["temp_high"],
+        "temp_critical_low":  d["temp_critical_low"],
+        "temp_critical_high": d["temp_critical_high"],
+        "humidity_max":       d["humidity_max"],
+        "max_excursion_min":  d["max_excursion_min"],
+        "freeze_sensitive":   d["freeze_sensitive"],
+    })
+
+sb.table("product_profiles").upsert(profile_rows).execute()
+print(f"[OK] product_profiles — {len(profile_rows)} rows")
+
+
+# ── 2. product_costs (flat top-level + JSONB nested) ───────────
+cost_rows = []
+for pid, d in costs.items():
+    cost_rows.append({
+        "product_id":               pid,
+        "product_name":             d.get("product_name"),
+        "regulatory_class":         d.get("regulatory_class"),
+        "cold_chain_category":      d.get("cold_chain_category"),
+        "who_atc_code":             d.get("who_atc_code"),
+        "therapeutic_area":         d.get("therapeutic_area"),
+        "unit_cost_usd":            d.get("unit_cost_usd"),
+        "units_per_shipment":       d.get("units_per_shipment"),
+        "currency":                 d.get("currency"),
+        "shipment_value_usd":       d.get("shipment_value_usd"),
+        "cost_components":          d.get("cost_components"),
+        "downstream_impact":        d.get("downstream_impact"),
+        "replacement":              d.get("replacement"),
+        "product_characteristics":  d.get("product_characteristics"),
+    })
+
+sb.table("product_costs").upsert(cost_rows).execute()
+print(f"[OK] product_costs     — {len(cost_rows)} rows")
+
+
+# ── 3. facilities (flat top-level + JSONB backup_facility) ──────
+facility_rows = []
+for pid, d in facilities.items():
+    facility_rows.append({
+        "product_id":                    pid,
+        "product_name":                  d.get("product_name"),
+        "cold_chain_class":              d.get("cold_chain_class"),
+        "accepts_temp_range":            d.get("accepts_temp_range"),
+        "facility_id":                   d.get("id"),
+        "role":                          d.get("role"),
+        "name":                          d.get("name"),
+        "full_address":                  d.get("full_address"),
+        "city":                          d.get("city"),
+        "country":                       d.get("country"),
+        "airport_code":                  d.get("airport_code"),
+        "timezone":                      d.get("timezone"),
+        "location":                      d.get("location"),
+        "contact":                       d.get("contact"),
+        "emergency_contact":             d.get("emergency_contact"),
+        "emergency_phone":               d.get("emergency_phone"),
+        "operating_hours":               d.get("operating_hours"),
+        "certifications":                d.get("certifications"),
+        "storage_capacity_units":        d.get("storage_capacity_units"),
+        "current_occupancy_pct":         d.get("current_occupancy_pct"),
+        "temp_range_supported":          d.get("temp_range_supported"),
+        "accepts_emergency_delivery":    d.get("accepts_emergency_delivery"),
+        "min_advance_notice_hours":      d.get("min_advance_notice_hours"),
+        "receiving_dock_temp_controlled":d.get("receiving_dock_temp_controlled"),
+        "pharmacist_on_site_24h":        d.get("pharmacist_on_site_24h"),
+        "cold_chain_validated_receiving":d.get("cold_chain_validated_receiving"),
+        "appointment_count":             d.get("appointment_count"),
+        "notes":                         d.get("notes"),
+        "backup_facility":               d.get("backup_facility"),
+    })
+
+sb.table("facilities").upsert(facility_rows).execute()
+print(f"[OK] facilities        — {len(facility_rows)} rows")
+
+print("\nAll done. All 3 tables loaded.")
