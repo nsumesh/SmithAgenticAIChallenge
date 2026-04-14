@@ -1,38 +1,67 @@
-# Python
+# ── Python ────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
-*.egg-info/
+*.pyo
+*.pyd
+*.so
 *.egg
+*.egg-info/
 dist/
 build/
 .eggs/
-*.so
+.Python
 
-# Virtual environments
+# ── Virtual environments ──────────────────────────────────
 .venv/
 venv/
 env/
+ENV/
+.env/
 
-# IDE
+# ── Environment variables ─────────────────────────────────
+.env
+.env.local
+.env.*.local
+*.env
+
+# ── IDE and editor ────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
 .DS_Store
+Thumbs.db
 
-# Generated artifacts (large binary files)
-artifacts/xgb_spoilage.joblib
+# ── Claude Code ───────────────────────────────────────────
+.claude/
 
-# Runtime audit logs (generated on each run)
-audit_logs/compliance_events.jsonl
-
-# Dashboard
-dashboard/node_modules/
-dashboard/dist/
-
-# Jupyter
+# ── Jupyter ───────────────────────────────────────────────
 .ipynb_checkpoints/
+*.ipynb_checkpoints
 
-# Environment variables
-.env
-.env.local
+# ── ML artifacts — keep .joblib in artifacts/ but ignore root-level ──
+*.joblib
+!artifacts/*.joblib
+
+# ── Backup files we created ───────────────────────────────
+*.bak
+
+# ── Logs ─────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Node / frontend ───────────────────────────────────────
+node_modules/
+dashboard/node_modules/
+.npm/
+*.tsbuildinfo
+
+# ── OS ───────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V2
+.Trashes
+ehthumbs.db
+Thumbs.db
