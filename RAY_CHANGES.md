@@ -332,3 +332,64 @@ ray/agents-final
 ---
 
 *Written by Mukul Ray — April 2026*
+
+---
+
+## Change 6 — Triage agent: real data enrichment + API endpoints
+
+**Files:** `tools/triage_agent.py`, `backend/app.py`
+**Commit:** 43a329c
+
+### What changed in triage_agent.py
+
+The original triage agent sorted shipments by tier and score — nothing else. It had no access to real excursion data and required `container_id` and `transit_phase` as non-optional fields, which caused KeyError crashes when called with minimal dicts.
+
+Three improvements:
+
+**1. Schema fix** — `container_id` and `transit_phase` are now `Optional[str]` with empty string defaults. The agent no longer crashes on minimal input.
+
+**2. Real data enrichment** — added `_enrich_shipment()` which pulls from `scored_windows.csv` and `product_profiles.json` to attach:
+- `hours_at_risk` — breach windows × 0.5hr (each window is 30 minutes)
+- `peak_temp_c` — highest avg_temp recorded for this shipment
+- `primary_breach_rule` — most frequently fired deterministic rule
+- `product_name` — human-readable name from product profiles
+- `windows_in_breach` / `total_windows` — breach density
+
+**3. Urgency labels** — each ranked item now carries a human-readable urgency string:
+- CRITICAL → "Immediate action required"
+- HIGH → "Intervene within 1 hour"
+- MEDIUM → "Monitor closely"
+- LOW → "Standard monitoring"
+
+**4. recommended_orchestration_order** — the output now includes a flat list of shipment IDs in priority order for shipments needing action. The frontend or batch endpoint can use this list directly to decide what to pass to `/api/orchestrator/run-batch`.
+
+### What changed in backend/app.py
+
+Two new endpoints:
+
+`GET /api/triage/critical-shipments?limit=N`
+Automatically pulls all CRITICAL and HIGH windows from the scored CSV, selects the worst window per shipment, runs triage ranking with enrichment, and returns the full priority list. No input needed — the endpoint does everything. This is the primary pre-orchestration step.
+
+`POST /api/triage/rank`
+Accepts a caller-supplied list of shipment dicts and ranks them. Each dict needs `shipment_id`, `risk_tier`, `fused_risk_score`, `product_id`. Also broadcasts a WebSocket event on completion.
+
+### Working output (real data)
+
+```
+Ranked 6 shipments — all CRITICAL at score=1.0 (synthetic dataset has severe excursions)
+
+#1 S019 — Vaccine-C (P06) — CRITICAL — Immediate action required
+   136.5h at risk | peak 14.79°C | 273/289 windows breached | rule: excursion_duration
+
+#2 S036 — Vaccine-C (P06) — CRITICAL — Immediate action required
+   167.0h at risk | peak 18.13°C | 334/344 windows breached
+
+#3 S021 — Frozen-Vaccine (P04) — CRITICAL — Immediate action required
+   134.5h at risk | peak -13.97°C | 269/408 windows breached
+
+recommended_orchestration_order: ['S019', 'S036', 'S021', ...]
+```
+
+### Demo note
+
+`GET /api/triage/critical-shipments` returns up to 20 shipments by default. Use `?limit=5` or `?limit=6` for the demo so the output is readable on screen. All 15 CRITICAL shipments in the dataset score 1.0 — use limit to keep it focused.
