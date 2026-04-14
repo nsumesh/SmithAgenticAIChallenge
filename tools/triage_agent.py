@@ -37,12 +37,12 @@ def _execute(shipments: List[ShipmentRiskSummary]) -> dict:
     for rank, s in enumerate(ranked, 1):
         priority_list.append({
             "priority_rank": rank,
-            "shipment_id": s["shipment_id"],
-            "container_id": s["container_id"],
-            "risk_tier": s["risk_tier"],
-            "fused_risk_score": s["fused_risk_score"],
-            "product_id": s["product_id"],
-            "needs_immediate_attention": s["risk_tier"] in ("CRITICAL", "HIGH"),
+            "shipment_id": s.get("shipment_id", ""),
+            "container_id": s.get("container_id", ""),
+            "risk_tier": s.get("risk_tier", ""),
+            "fused_risk_score": s.get("fused_risk_score", 0.0),
+            "product_id": s.get("product_id", ""),
+            "needs_immediate_attention": s.get("risk_tier", "") in ("CRITICAL", "HIGH"),
         })
     return {
         "tool": "triage_agent",

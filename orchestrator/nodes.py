@@ -229,6 +229,7 @@ def _build_tool_input(tool_name: str, ri: dict, state: dict) -> dict:
             **base,
             "current_leg_id": ri.get("leg_id", ""),
             "reason": state.get("primary_issue", "Risk detected") + context_suffix,
+            "product_id": ri.get("product_type", ""),
         }
 
     if tool_name == "insurance_agent":
