@@ -414,3 +414,6 @@ All data access goes through `src/supabase_client.py` with automatic local fallb
 | **Backend** | FastAPI, Pydantic, uvicorn |
 | **Frontend** | React 19, Vite, Tailwind CSS v4, Recharts, Mermaid |
 | **Compliance** | JSONL audit logs, SHAP explainability, human-in-the-loop |
+
+
+
