@@ -19,7 +19,14 @@ class EmbeddingGenerator:
     def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
         logger.info("Loading embedding model: %s …", model_name)
         self.model = SentenceTransformer(model_name)
-        self.embedding_dim = self.model.get_embedding_dimension()
+        # API changed in newer sentence_transformers: get_sentence_embedding_dimension()
+        # replaced get_embedding_dimension() which only exists in older versions
+        if hasattr(self.model, "get_sentence_embedding_dimension"):
+            self.embedding_dim = self.model.get_sentence_embedding_dimension()
+        elif hasattr(self.model, "get_embedding_dimension"):
+            self.embedding_dim = self.model.get_embedding_dimension()
+        else:
+            self.embedding_dim = self.model.encode("test").shape[0]
         logger.info("Embedding model ready (dim=%d)", self.embedding_dim)
 
     def generate_embedding(self, text: str) -> List[float]:

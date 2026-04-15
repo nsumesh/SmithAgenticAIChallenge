@@ -1,6 +1,10 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 
-const WS_URL = `ws://${window.location.host}/ws/events`;
+const _apiUrl = import.meta.env.VITE_API_URL ?? '';
+const _wsBase = _apiUrl
+  ? _apiUrl.replace(/^https/, 'wss').replace(/^http/, 'ws')
+  : `ws://${window.location.host}`;
+const WS_URL = `${_wsBase}/ws/events`;
 
 export function useWebSocket(eventTypes = []) {
   const [messages, setMessages] = useState([]);
