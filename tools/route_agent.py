@@ -279,13 +279,33 @@ Respond ONLY with valid JSON, no other text:
 
     try:
         client = Groq(api_key=api_key)
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=400,
-            timeout=15.0,
-        )
+
+        # Try primary model, fall back to mixtral if rate limited
+        primary_model = "llama-3.3-70b-versatile"
+        fallback_model = "llama-3.1-8b-instant"
+
+        try:
+            response = client.chat.completions.create(
+                model=primary_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=400,
+                timeout=15.0,
+            )
+            model_used = primary_model
+        except Exception as primary_exc:
+            if "429" in str(primary_exc) or "rate_limit" in str(primary_exc).lower():
+                logger.warning("Primary model rate limited, trying mixtral fallback")
+                response = client.chat.completions.create(
+                    model=fallback_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3,
+                    max_tokens=400,
+                    timeout=15.0,
+                )
+                model_used = fallback_model
+            else:
+                raise primary_exc
 
         raw = response.choices[0].message.content.strip()
         # Strip any markdown fences if present
@@ -301,9 +321,10 @@ Respond ONLY with valid JSON, no other text:
                 raise ValueError(f"Missing key: {key}")
 
         result["reasoning_source"] = "groq_llm"
+        result["model_used"] = model_used
         logger.info(
-            "Groq route recommendation for %s (%s): %s via %s",
-            shipment_id, temp_class, result["recommended_route"], result["carrier"]
+            "Groq route recommendation for %s (%s) via %s: %s via %s",
+            shipment_id, temp_class, model_used, result["recommended_route"], result["carrier"]
         )
         return result
 
@@ -413,6 +434,7 @@ def _execute(
         # New enriched fields
         "justification": route_result.get("justification", ""),
         "reasoning_source": route_result.get("reasoning_source", "unknown"),
+        "model_used": route_result.get("model_used"),
         "weather_at_destination": weather,
     }
 
