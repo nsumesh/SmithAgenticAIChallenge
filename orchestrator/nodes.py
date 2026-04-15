@@ -230,6 +230,14 @@ def _build_tool_input(tool_name: str, ri: dict, state: dict) -> dict:
             "current_leg_id": ri.get("leg_id", ""),
             "reason": state.get("primary_issue", "Risk detected") + context_suffix,
             "product_id": ri.get("product_type", ""),
+            "risk_tier": ri.get("risk_tier", ""),
+            "hours_to_breach": ri.get("hours_to_breach"),
+            "delay_class": ri.get("delay_class", ""),
+            "avg_temp_c": ri.get("avg_temp_c"),
+            "temp_slope_c_per_hr": ri.get("temp_slope_c_per_hr"),
+            "transit_phase": ri.get("transit_phase", ""),
+            "det_rules_fired": ri.get("deterministic_rule_flags", []),
+            "facility": ri.get("facility", {}),
         }
 
     if tool_name == "insurance_agent":
