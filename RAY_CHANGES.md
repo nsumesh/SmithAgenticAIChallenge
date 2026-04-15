@@ -393,3 +393,72 @@ recommended_orchestration_order: ['S019', 'S036', 'S021', ...]
 ### Demo note
 
 `GET /api/triage/critical-shipments` returns up to 20 shipments by default. Use `?limit=5` or `?limit=6` for the demo so the output is readable on screen. All 15 CRITICAL shipments in the dataset score 1.0 — use limit to keep it focused.
+
+---
+
+## Change 7 — Route agent: Live weather + Groq LLM reasoning
+
+**Files:** `tools/route_agent.py`
+**Commits:** 95b3bc7, 3abb382, 452786d, 81614e6
+
+### What changed
+
+The original route agent used `random.choice` over 4 hardcoded strings, then was upgraded to a deterministic lookup table keyed by temperature class. Both approaches produced the same output regardless of actual shipment conditions.
+
+This change replaces the lookup table entirely with a two-stage pipeline:
+
+**Stage 1 — Open-Meteo live weather fetch**
+- Calls `https://api.open-meteo.com/v1/forecast` with coordinates for the destination facility
+- Free, no API key required, returns current temperature, wind speed, precipitation, and WMO weather code
+- Maps WMO codes to human-readable descriptions and flags severe weather codes (thunderstorms, heavy snow, violent showers)
+- Coordinates looked up from `facilities.json` city field — P01 maps to London LHR, P04 to Chicago ORD, etc.
+- Graceful fallback if API is unavailable — does not crash, logs warning
+
+**Stage 2 — Groq LLM reasoning**
+- Calls `llama-3.3-70b-versatile` with full shipment context:
+  - Product name, temperature class, required range, freeze sensitivity
+  - Current container temperature and slope (°C/hr)
+  - Hours until breach (or "already breached")
+  - Delay class, active breach rules, transit phase, risk tier
+  - Live weather at destination
+- Prompt explicitly instructs the model to recommend a carrier and mode — not invent geographic routes
+- For CRITICAL already-breached shipments, urgency instruction forces negative ETA change
+- Per-class carrier guidance in prompt: Atlas Air/Cargolux for frozen, BA World Cargo/DHL for refrigerated, FedEx/UPS for CRT
+- Returns `recommended_route`, `carrier`, `eta_change_hours`, `justification`, `model_used`
+- Fallback chain: `llama-3.3-70b-versatile` → `llama-3.1-8b-instant` (rate limit) → deterministic (API failure)
+- JSON truncation guard: `max_tokens=600` + closing-brace repair if response is cut off
+
+### Working output (live, primary model)
+
+```
+Product:   Vaccine-C (P06) — REFRIGERATED — must maintain 2-8°C
+Weather:   overcast, 25.4°C, wind 11.2mph at Chicago ORD (Open-Meteo live)
+Route:     Air freight via ORD (GDP-certified pharma lane)
+Carrier:   DHL Life Sciences
+ETA:       -2 hours
+Model:     llama-3.3-70b-versatile
+Source:    groq_llm
+Justification: Given the critical temperature breach and the need for
+rapid transport, DHL Life Sciences is recommended for its GDP-certified
+pharma lane capabilities. The overcast conditions at ORD are manageable
+for air freight, and the -2 hour ETA improvement minimises further
+exposure time for this freeze-sensitive product.
+```
+
+### Why this is genuinely agentic
+
+The justification changes based on actual conditions. A shipment with severe weather at destination gets a different recommendation than the same product in clear skies. A frozen product at air_handoff with 0 hours to breach gets a different urgency framing than a CRT product with 2.5 hours buffer. The LLM reasons about the combination of factors — not pattern-matches against a table.
+
+### Data sources
+
+- `data/product_profiles.json` — temperature class classification
+- `data/facilities.json` — destination facility city for weather coordinates
+- Open-Meteo API — live weather (no key required)
+- Groq API — LLM reasoning (key in `.env`, gitignored)
+
+### Demo script
+
+`demo_smoke_test.py` at repo root runs the full cascade in one command:
+```bash
+.venv/Scripts/python demo_smoke_test.py
+```

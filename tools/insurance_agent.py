@@ -25,7 +25,7 @@ _facilities_cache: Optional[dict] = None
 def _load_facilities() -> dict:
     global _facilities_cache
     if _facilities_cache is None:
-        with open(_FACILITIES_PATH) as f:
+        with open(_FACILITIES_PATH, encoding='utf-8') as f:
             _facilities_cache = json.load(f)
     return _facilities_cache
 
@@ -44,7 +44,7 @@ def _get_scored_df() -> pd.DataFrame:
 def _load_costs() -> dict:
     global _costs_cache
     if _costs_cache is None:
-        with open(_COSTS_PATH) as f:
+        with open(_COSTS_PATH, encoding='utf-8') as f:
             _costs_cache = json.load(f)
     return _costs_cache
 

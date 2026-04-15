@@ -1,17 +1,21 @@
 """
-Demo smoke test — SmithAgenticAIChallenge
+Demo smoke test - SmithAgenticAIChallenge
 Pharmaceutical Cold Chain Risk Intelligence
 
 Runs the full cascade in sequence:
-  1. Triage — rank at-risk shipments from real scored data
-  2. Route agent — live weather + Groq LLM reasoning
-  3. Insurance agent — real excursion data + itemised loss
+  1. Triage - rank at-risk shipments from real scored data
+  2. Route agent - live weather + Groq LLM reasoning
+  3. Insurance agent - real excursion data + itemised loss
   4. Triage output shows what to pass to orchestrator
 
 This is the demo script. Run with:
   .venv/Scripts/python demo_smoke_test.py
 """
-import sys, os, json
+import sys
+import io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+
+import os, json
 from pathlib import Path
 from datetime import datetime
 
@@ -43,14 +47,20 @@ def section(title):
 def run_demo():
     print(f"\n{'='*65}")
     print("  SMITH AGENTIC AI CHALLENGE")
-    print("  Pharmaceutical Cold Chain Risk Intelligence — Demo Run")
+    print("  Pharmaceutical Cold Chain Risk Intelligence - Demo Run")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print(f"{'='*65}")
 
-    # ─────────────────────────────────────────────────────────
-    # STEP 1: TRIAGE — rank at-risk shipments
-    # ─────────────────────────────────────────────────────────
-    header("STEP 1 — TRIAGE: Rank At-Risk Shipments")
+    groq_key = os.environ.get('GROQ_API_KEY', '')
+    if not groq_key or groq_key == 'your_key_here':
+        print('\n  WARNING: No GROQ_API_KEY set in .env')
+        print('  Route agent will use deterministic fallback (no LLM reasoning)')
+        print('  Add your Groq key to .env to enable live LLM reasoning\n')
+
+    # ----------------------------------------------------------------
+    # STEP 1: TRIAGE - rank at-risk shipments
+    # ----------------------------------------------------------------
+    header("STEP 1 - TRIAGE: Rank At-Risk Shipments")
 
     from tools.triage_agent import _execute as triage_execute
 
@@ -84,7 +94,7 @@ def run_demo():
 
     for item in triage_result['priority_list']:
         hrs = f"{item['hours_at_risk']}h" if item['hours_at_risk'] else "n/a"
-        peak = f"{item['peak_temp_c']}°C" if item['peak_temp_c'] else "n/a"
+        peak = f"{item['peak_temp_c']}C" if item['peak_temp_c'] else "n/a"
         print(f"  {item['priority_rank']:<5} {item['shipment_id']:<10} "
               f"{item['product_name'][:28]:<30} {item['risk_tier']:<10} "
               f"{item['fused_risk_score']:<8.3f} {hrs:<12} {peak}")
@@ -98,10 +108,10 @@ def run_demo():
     top_leg = df[df['shipment_id'] == top_shipment]['leg_id'].iloc[0]
     top_row = worst[worst['shipment_id'] == top_shipment].iloc[0]
 
-    # ─────────────────────────────────────────────────────────
-    # STEP 2: ROUTE AGENT — live weather + LLM reasoning
-    # ─────────────────────────────────────────────────────────
-    header(f"STEP 2 — ROUTE AGENT: Shipment {top_shipment} ({top_product})")
+    # ----------------------------------------------------------------
+    # STEP 2: ROUTE AGENT - live weather + LLM reasoning
+    # ----------------------------------------------------------------
+    header(f"STEP 2 - ROUTE AGENT: Shipment {top_shipment} ({top_product})")
 
     from tools.route_agent import _execute as route_execute
 
@@ -114,7 +124,7 @@ def run_demo():
         shipment_id=top_shipment,
         container_id=str(top_row.get('container_id', '')),
         current_leg_id=top_leg,
-        reason=f"CRITICAL temperature excursion — {top['product_name']}",
+        reason=f"CRITICAL temperature excursion - {top['product_name']}",
         product_id=top_product,
         preferred_mode='air',
         risk_tier=str(top_row['risk_tier']),
@@ -133,8 +143,8 @@ def run_demo():
     print(f"\n  LIVE WEATHER AT DESTINATION")
     print(f"  Facility:     {weather['facility_name']}")
     print(f"  Location:     {weather['location']}")
-    print(f"  Conditions:   {weather['weather_description']}, {weather['temperature_c']}°C, wind {weather['wind_speed_mph']}mph")
-    print(f"  Severe alert: {'YES ⚠' if weather['is_severe_weather'] else 'No'}")
+    print(f"  Conditions:   {weather['weather_description']}, {weather['temperature_c']}C, wind {weather['wind_speed_mph']}mph")
+    print(f"  Severe alert: {'YES [!]' if weather['is_severe_weather'] else 'No'}")
     print(f"  Data source:  {weather['data_source']}")
     print(f"\n  RECOMMENDATION")
     print(f"  Route:        {route_result['recommended_route']}")
@@ -147,10 +157,10 @@ def run_demo():
     print(f"  {route_result['justification']}")
     print(f"\n  Requires approval: {route_result['requires_approval']}")
 
-    # ─────────────────────────────────────────────────────────
-    # STEP 3: INSURANCE AGENT — real excursion data
-    # ─────────────────────────────────────────────────────────
-    header(f"STEP 3 — INSURANCE AGENT: Claim for {top_shipment}")
+    # ----------------------------------------------------------------
+    # STEP 3: INSURANCE AGENT - real excursion data
+    # ----------------------------------------------------------------
+    header(f"STEP 3 - INSURANCE AGENT: Claim for {top_shipment}")
 
     from tools.insurance_agent import _execute as ins_execute
 
@@ -162,7 +172,7 @@ def run_demo():
         incident_summary=(
             f"Temperature excursion confirmed on {top['product_name']}. "
             f"{top['hours_at_risk']} hours at risk. "
-            f"Peak temperature {top['peak_temp_c']}°C recorded. "
+            f"Peak temperature {top['peak_temp_c']}C recorded. "
             f"Primary breach rule: {top['primary_breach_rule']}."
         ),
         leg_id=top_leg,
@@ -180,7 +190,7 @@ def run_demo():
     print(f"  Windows analysed:   {exc.get('windows_analysed', 0)}")
     print(f"  Windows in breach:  {exc.get('windows_in_breach', 0)}")
     print(f"  Total excursion:    {exc.get('total_excursion_min', 0)} minutes")
-    print(f"  Peak temperature:   {exc.get('peak_temp_c')}°C")
+    print(f"  Peak temperature:   {exc.get('peak_temp_c')}C")
     print(f"\n  ITEMISED LOSS ESTIMATE")
     print(f"  Product loss:           ${lb.get('product_loss_usd', 0):>12,.2f}")
     print(f"  Disposal cost:          ${lb.get('disposal_cost_usd', 0):>12,.2f}")
@@ -191,21 +201,21 @@ def run_demo():
     print(f"  TOTAL ESTIMATED LOSS:   ${ins_result['estimated_loss_usd']:>12,.2f}")
     print(f"\n  Next steps:")
     for step in ins_result['next_steps']:
-        print(f"    • {step}")
+        print(f"    * {step}")
     print(f"\n  Requires approval: {ins_result['requires_approval']}")
 
-    # ─────────────────────────────────────────────────────────
+    # ----------------------------------------------------------------
     # SUMMARY
-    # ─────────────────────────────────────────────────────────
-    header("DEMO COMPLETE — Cascade Summary")
+    # ----------------------------------------------------------------
+    header("DEMO COMPLETE - Cascade Summary")
 
     groq_fired = route_result.get('reasoning_source') == 'groq_llm'
     weather_live = weather.get('data_source') == 'Open-Meteo live'
 
-    print(f"\n  Shipment:         {top_shipment} ({top_product} — {top['product_name']})")
+    print(f"\n  Shipment:         {top_shipment} ({top_product} - {top['product_name']})")
     print(f"  Risk tier:        CRITICAL")
     print(f"  Hours at risk:    {top['hours_at_risk']}h")
-    print(f"  Peak temp:        {top['peak_temp_c']}°C")
+    print(f"  Peak temp:        {top['peak_temp_c']}C")
     print(f"\n  Triage:           {triage_result['total_shipments']} shipments ranked from real data")
     print(f"  Weather fetch:    {'LIVE (Open-Meteo)' if weather_live else 'unavailable'}")
     print(f"  LLM reasoning:    {'Groq ' + route_result.get('model_used','') if groq_fired else 'deterministic fallback'}")
