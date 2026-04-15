@@ -55,13 +55,13 @@ for _name, _tool in TOOL_MAP.items():
     schema = _tool.args_schema.model_json_schema() if _tool.args_schema else {}
     props = schema.get("properties", {})
     required = schema.get("required", [])
+    req_fields = [f for f in required if f in props]
     fields = []
-    for fname, finfo in props.items():
-        req_marker = " (REQUIRED)" if fname in required else ""
+    for fname in req_fields:
+        finfo = props[fname]
         ftype = finfo.get("type", "string")
-        fdesc = finfo.get("description", "")
-        fields.append(f"      {fname}: {ftype}{req_marker} -- {fdesc}")
-    TOOL_SCHEMAS[_name] = f"  {_name}: {_tool.description}\n    Input fields:\n" + "\n".join(fields)
+        fields.append(f"{fname}:{ftype}")
+    TOOL_SCHEMAS[_name] = f"  {_name}({', '.join(fields)})"
 
 TOOLS_REFERENCE = "\n".join(TOOL_SCHEMAS.values())
 

@@ -39,10 +39,36 @@ def load_product_profiles(path: Path | None = None) -> Dict[str, dict]:
         return json.load(f)
 
 
-def load_raw(csv_path: Path | None = None) -> pd.DataFrame:
+def load_raw(csv_path: Path | None = None, force_csv: bool = False) -> pd.DataFrame:
+    """
+    Load telemetry data. Tries Supabase window_features first, falls back to local CSV.
+    Set force_csv=True to skip Supabase entirely.
+    """
+    if not force_csv:
+        try:
+            from src.supabase_client import fetch_window_features, is_available
+            if is_available():
+                df = fetch_window_features()
+                if df is not None and not df.empty:
+                    logger.info("Loaded %d rows from Supabase window_features", len(df))
+                    return df
+                logger.info("Supabase window_features empty; falling back to CSV")
+        except Exception as e:
+            logger.warning("Supabase fetch failed (%s); falling back to CSV", e)
+
     csv_path = csv_path or DATA_DIR / "single_table.csv"
     df = pd.read_csv(csv_path, parse_dates=["window_start", "window_end"])
+    logger.info("Loaded %d rows from %s", len(df), csv_path.name)
     return df
+
+
+def load_product_profiles_smart() -> Dict[str, dict]:
+    """Load product profiles from Supabase, fall back to local JSON."""
+    try:
+        from src.supabase_client import load_profiles_with_fallback
+        return load_profiles_with_fallback()
+    except Exception:
+        return load_product_profiles()
 
 
 def validate(df: pd.DataFrame) -> pd.DataFrame:

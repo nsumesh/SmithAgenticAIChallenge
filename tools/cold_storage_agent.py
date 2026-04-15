@@ -22,15 +22,23 @@ _profiles_cache:   Optional[dict] = None
 def _load_facilities() -> dict:
     global _facilities_cache
     if _facilities_cache is None:
-        with open(_FACILITIES_PATH) as f:
-            _facilities_cache = json.load(f)
+        try:
+            from src.supabase_client import load_facilities_with_fallback
+            _facilities_cache = load_facilities_with_fallback()
+        except Exception:
+            with open(_FACILITIES_PATH) as f:
+                _facilities_cache = json.load(f)
     return _facilities_cache
 
 
 def _load_profiles() -> dict:
     global _profiles_cache
     if _profiles_cache is None:
-        _profiles_cache = load_product_profiles(_PROFILES_PATH)
+        try:
+            from src.supabase_client import load_profiles_with_fallback
+            _profiles_cache = load_profiles_with_fallback()
+        except Exception:
+            _profiles_cache = load_product_profiles(_PROFILES_PATH)
     return _profiles_cache
 
 

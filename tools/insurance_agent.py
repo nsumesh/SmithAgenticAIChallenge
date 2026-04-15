@@ -18,6 +18,20 @@ _COSTS_PATH = _BASE / "data" / "product_costs.json"
 
 _scored_df: Optional[pd.DataFrame] = None
 _costs_cache: Optional[dict] = None
+_FACILITIES_PATH = _BASE / "data" / "facilities.json"
+_facilities_cache: Optional[dict] = None
+
+
+def _load_facilities() -> dict:
+    global _facilities_cache
+    if _facilities_cache is None:
+        try:
+            from src.supabase_client import load_facilities_with_fallback
+            _facilities_cache = load_facilities_with_fallback()
+        except Exception:
+            with open(_FACILITIES_PATH) as f:
+                _facilities_cache = json.load(f)
+    return _facilities_cache
 
 
 def _get_scored_df() -> pd.DataFrame:
@@ -34,12 +48,16 @@ def _get_scored_df() -> pd.DataFrame:
 def _load_costs() -> dict:
     global _costs_cache
     if _costs_cache is None:
-        with open(_COSTS_PATH) as f:
-            _costs_cache = json.load(f)
+        try:
+            from src.supabase_client import load_costs_with_fallback
+            _costs_cache = load_costs_with_fallback()
+        except Exception:
+            with open(_COSTS_PATH) as f:
+                _costs_cache = json.load(f)
     return _costs_cache
 
 
-def _aggregate_leg_history(leg_id: str) -> Dict[str, Any]:
+def _aggregate_leg_history(leg_id: str, product_id: str = "") -> Dict[str, Any]:
     """
     Pull all scored windows for a leg and compute excursion metrics.
 
@@ -49,8 +67,11 @@ def _aggregate_leg_history(leg_id: str) -> Dict[str, Any]:
       window_count          total windows in the leg
       windows_in_breach     windows where det_score > 0
       breach_timeline       list of {window_id, avg_temp_c, rules_fired}
-                            for breached windows (up to 10 most recent)
+      appointment_count     from facilities.json for downstream disruption calc
     """
+    facilities = _load_facilities()
+    appt_count = facilities.get(product_id, {}).get("appointment_count", 0)
+
     df = _get_scored_df()
     leg_df = df[df["leg_id"] == leg_id].copy()
 
@@ -62,6 +83,7 @@ def _aggregate_leg_history(leg_id: str) -> Dict[str, Any]:
             "window_count": 0,
             "windows_in_breach": 0,
             "breach_timeline": [],
+            "appointment_count": appt_count,
         }
 
     total_excursion = int(leg_df["minutes_outside_range"].sum())
@@ -88,6 +110,7 @@ def _aggregate_leg_history(leg_id: str) -> Dict[str, Any]:
         "window_count": window_count,
         "windows_in_breach": windows_in_breach,
         "breach_timeline": breach_timeline,
+        "appointment_count": appt_count,
     }
 
 
@@ -186,14 +209,15 @@ def _execute(
     leg_history: Dict[str, Any] = {}
     if leg_id:
         try:
-            leg_history = _aggregate_leg_history(leg_id)
+            leg_history = _aggregate_leg_history(leg_id, product_id=product_id)
         except Exception as exc:
             logger.warning("Could not aggregate leg history for %s: %s", leg_id, exc)
 
-    # Compute itemised loss breakdown
+    # Compute itemised loss breakdown with real appointment_count from facilities
     loss_breakdown: Dict[str, Any] = {}
     if spoilage_probability is not None:
-        loss_breakdown = _compute_loss_breakdown(product_id, spoilage_probability)
+        appt_count = leg_history.get("appointment_count", 0) if leg_history else 0
+        loss_breakdown = _compute_loss_breakdown(product_id, spoilage_probability, appointment_count=appt_count)
         if estimated_loss_usd is None:
             estimated_loss_usd = loss_breakdown["total_estimated_loss_usd"]
 

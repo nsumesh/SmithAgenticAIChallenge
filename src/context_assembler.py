@@ -35,16 +35,24 @@ _product_costs: Optional[Dict[str, dict]] = None
 def _load_facilities() -> Dict[str, dict]:
     global _facilities
     if _facilities is None:
-        with open(_DATA_DIR / "facilities.json") as f:
-            _facilities = json.load(f)
+        try:
+            from src.supabase_client import load_facilities_with_fallback
+            _facilities = load_facilities_with_fallback()
+        except Exception:
+            with open(_DATA_DIR / "facilities.json") as f:
+                _facilities = json.load(f)
     return _facilities
 
 
 def _load_product_costs() -> Dict[str, dict]:
     global _product_costs
     if _product_costs is None:
-        with open(_DATA_DIR / "product_costs.json") as f:
-            _product_costs = json.load(f)
+        try:
+            from src.supabase_client import load_costs_with_fallback
+            _product_costs = load_costs_with_fallback()
+        except Exception:
+            with open(_DATA_DIR / "product_costs.json") as f:
+                _product_costs = json.load(f)
     return _product_costs
 
 

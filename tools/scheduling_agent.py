@@ -19,8 +19,12 @@ _facilities_cache: Optional[dict] = None
 def _load_facilities() -> dict:
     global _facilities_cache
     if _facilities_cache is None:
-        with open(_FACILITIES_PATH) as f:
-            _facilities_cache = json.load(f)
+        try:
+            from src.supabase_client import load_facilities_with_fallback
+            _facilities_cache = load_facilities_with_fallback()
+        except Exception:
+            with open(_FACILITIES_PATH) as f:
+                _facilities_cache = json.load(f)
     return _facilities_cache
 
 
@@ -31,8 +35,12 @@ _costs_cache: Optional[dict] = None
 def _load_product_costs() -> dict:
     global _costs_cache
     if _costs_cache is None:
-        with open(_COSTS_PATH) as f:
-            _costs_cache = json.load(f)
+        try:
+            from src.supabase_client import load_costs_with_fallback
+            _costs_cache = load_costs_with_fallback()
+        except Exception:
+            with open(_COSTS_PATH) as f:
+                _costs_cache = json.load(f)
     return _costs_cache
 
 
@@ -87,6 +95,14 @@ class SchedulingInput(BaseModel):
     risk_tier: Optional[str] = Field(
         default=None,
         description="Risk tier from orchestrator: LOW | MEDIUM | HIGH | CRITICAL",
+    )
+    advance_notice_required_hours: Optional[float] = Field(
+        default=None,
+        description="Hours of advance notice the facility requires (cascade-enriched)",
+    )
+    temp_range_supported: Optional[str] = Field(
+        default=None,
+        description="Temp range the cold-storage facility supports (cascade-enriched)",
     )
 
 
@@ -355,6 +371,8 @@ def _execute(
     hours_to_breach: Optional[float] = None,
     ml_spoilage_probability: Optional[float] = None,
     risk_tier: Optional[str] = None,
+    advance_notice_required_hours: Optional[float] = None,
+    temp_range_supported: Optional[str] = None,
 ) -> dict:
     # ── Step 1: Load data ─────────────────────────────────────────────
     facilities    = _load_facilities()

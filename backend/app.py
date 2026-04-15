@@ -28,6 +28,7 @@ from backend.models import (
     WindowRisk,
 )
 from tools.approval_workflow import _PENDING_APPROVALS, decide as approve_decide, get_pending
+from tools.triage_agent import _execute as triage_execute, _enrich_shipment
 from tools import TOOL_MAP
 from orchestrator.graph import run_orchestrator, get_graph_mermaid, get_mode
 from orchestrator.llm_provider import get_llm, get_provider_name, get_model_name
@@ -321,7 +322,7 @@ def llm_status():
     """Full LLM provider status: active provider, available providers, and config."""
     import orchestrator.llm_provider as prov
     available = []
-    for name in ["ollama", "openai", "anthropic"]:
+    for name in ["groq", "ollama", "openai", "anthropic"]:
         factory = prov._PROVIDERS.get(name)
         if factory:
             try:
@@ -334,9 +335,10 @@ def llm_status():
         "active_provider": get_provider_name(),
         "active_model": get_model_name(),
         "mode": "agentic" if get_llm() is not None else "deterministic",
-        "priority": os.environ.get("CARGO_LLM_PRIORITY", "ollama,openai,anthropic"),
+        "priority": os.environ.get("CARGO_LLM_PRIORITY", "groq,ollama,openai,anthropic"),
         "providers": available,
         "keys_configured": {
+            "groq": bool(os.environ.get("GROQ_API_KEY", "")),
             "openai": bool(os.environ.get("OPENAI_API_KEY", "")),
             "anthropic": bool(os.environ.get("ANTHROPIC_API_KEY", "")),
         },
@@ -352,6 +354,9 @@ async def configure_llm(config: Dict[str, Any]):
     import orchestrator.llm_provider as prov
 
     changed = []
+    if "groq_api_key" in config:
+        os.environ["GROQ_API_KEY"] = config["groq_api_key"]
+        changed.append("GROQ_API_KEY")
     if "openai_api_key" in config:
         os.environ["OPENAI_API_KEY"] = config["openai_api_key"]
         changed.append("OPENAI_API_KEY")
@@ -361,6 +366,9 @@ async def configure_llm(config: Dict[str, Any]):
     if "priority" in config:
         os.environ["CARGO_LLM_PRIORITY"] = config["priority"]
         changed.append("CARGO_LLM_PRIORITY")
+    if "groq_model" in config:
+        os.environ["CARGO_GROQ_MODEL"] = config["groq_model"]
+        changed.append("CARGO_GROQ_MODEL")
     if "ollama_model" in config:
         os.environ["CARGO_OLLAMA_MODEL"] = config["ollama_model"]
         changed.append("CARGO_OLLAMA_MODEL")
@@ -466,6 +474,90 @@ def graph_topology():
     }
 
 
+# ── Triage ────────────────────────────────────────────────────────────
+
+@app.get("/api/triage/critical-shipments")
+async def triage_critical_shipments(limit: int = Query(20, le=100)):
+    """
+    Auto-triage: pull all CRITICAL+HIGH windows, find worst per shipment,
+    rank with enrichment, return priority list.
+    """
+    df = _get_df()
+    critical = df[df["risk_tier"].isin(["CRITICAL", "HIGH"])]
+    if critical.empty:
+        return {"priority_list": [], "total_shipments": 0}
+
+    worst = critical.sort_values("final_score", ascending=False).groupby("shipment_id").first().reset_index()
+    shipments = [
+        {
+            "shipment_id": row["shipment_id"],
+            "risk_tier": row["risk_tier"],
+            "fused_risk_score": float(row["final_score"]),
+            "product_id": row["product_id"],
+            "container_id": row.get("container_id", ""),
+            "transit_phase": str(row.get("transit_phase", "")),
+        }
+        for _, row in worst.head(limit).iterrows()
+    ]
+    result = triage_execute(shipments=shipments, enrich=True)
+    await _broadcast({"type": "triage_ranked", "count": len(shipments)})
+    return result
+
+
+@app.post("/api/triage/rank")
+async def triage_rank(payload: Dict[str, Any]):
+    """Rank a caller-supplied list of shipment dicts."""
+    shipments = payload.get("shipments", [])
+    enrich = payload.get("enrich", True)
+    result = triage_execute(shipments=shipments, enrich=enrich)
+    await _broadcast({"type": "triage_ranked", "count": len(shipments)})
+    return result
+
+
+# ── Data Ingest (Karthik's Supabase pipeline) ────────────────────────
+
+@app.post("/api/ingest")
+async def ingest_window(payload: Dict[str, Any]):
+    """
+    Receive a single window_features row (from Supabase stream_listener
+    or direct POST) and score it through the risk engine in real time.
+    Returns the risk assessment and optionally triggers orchestration.
+    """
+    from src.feature_engineering import engineer_features
+    from src.deterministic_engine import score_row
+    from src.risk_fusion import fuse_scores
+
+    profiles = _get_profiles()
+    row_df = pd.DataFrame([payload])
+    for col in ("window_start", "window_end"):
+        if col in row_df.columns:
+            row_df[col] = pd.to_datetime(row_df[col], errors="coerce")
+    row_df = engineer_features(row_df, profiles)
+    row = row_df.iloc[0]
+
+    det_score, det_results = score_row(row, profiles)
+    rules_fired = [r.rule_name for r in det_results if r.fired]
+
+    ml_score = float(payload.get("ml_score", det_score * 0.8))
+
+    final_score, risk_tier, actions, requires_human = fuse_scores(det_score, ml_score)
+
+    result = {
+        "window_id": payload.get("window_id"),
+        "shipment_id": payload.get("shipment_id"),
+        "risk_score": round(final_score, 4),
+        "risk_tier": risk_tier,
+        "det_score": round(det_score, 4),
+        "ml_score": round(ml_score, 4),
+        "rules_fired": rules_fired,
+        "recommended_actions": actions,
+        "requires_human_approval": requires_human,
+    }
+
+    await _broadcast({"type": "ingest_scored", "result": result})
+    return result
+
+
 # ── Helpers ──────────────────────────────────────────────────────────
 
 def _build_shipment_summaries(
@@ -515,10 +607,14 @@ def _row_to_window(row) -> WindowRisk:
 
 def _load_audit_records() -> List[dict]:
     records = []
-    for path in sorted(AUDIT_DIR.glob("audit_*.jsonl")):
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    records.append(json.loads(line))
+    all_paths = sorted(AUDIT_DIR.glob("audit_*.jsonl")) + sorted(AUDIT_DIR.glob("compliance_events.jsonl"))
+    for path in all_paths:
+        try:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        records.append(json.loads(line))
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Could not read audit file %s: %s", path, exc)
     return records

@@ -184,10 +184,18 @@ def _build_tool_input(tool_name: str, ri: dict, state: dict) -> dict:
             "details": {
                 "fused_score": ri.get("fused_risk_score"),
                 "ml_prob": ri.get("ml_spoilage_probability"),
+                "spoilage_probability": ri.get("ml_spoilage_probability", 0.0),
                 "rules": ri.get("deterministic_rule_flags", []),
                 "primary_issue": state.get("primary_issue", ""),
                 "delay_class": delay_class,
                 "hours_to_breach": hours_to_breach,
+                "product_category": ri.get("product_type", "standard_refrigerated"),
+                "current_temp_c": ri.get("avg_temp_c", 0.0),
+                "avg_temp_c": ri.get("avg_temp_c", 0.0),
+                "minutes_outside_range": ri.get("minutes_outside_range", 0),
+                "transit_phase": ri.get("transit_phase", "unknown"),
+                "at_risk_value": float(product_cost.get("unit_cost_usd", 0))
+                    * int(product_cost.get("units_per_shipment", 0)),
             },
             "regulatory_tags": ["GDP", "FDA_21CFR11"],
         }
@@ -236,6 +244,7 @@ def _build_tool_input(tool_name: str, ri: dict, state: dict) -> dict:
             **base,
             "current_leg_id": ri.get("leg_id", ""),
             "reason": state.get("primary_issue", "Risk detected") + context_suffix,
+            "product_id": ri.get("product_type", ""),
         }
 
     if tool_name == "insurance_agent":
@@ -450,7 +459,25 @@ def _enrich_tool_input(
     """
     enriched = dict(base_input)
 
-    if tool_name == "notification_agent":
+    if tool_name == "compliance_agent":
+        details = enriched.get("details", {})
+        if not isinstance(details, dict):
+            details = {}
+        details.setdefault("product_category", ri.get("product_type", "standard_refrigerated"))
+        details.setdefault("current_temp_c", ri.get("avg_temp_c", 0.0))
+        details.setdefault("avg_temp_c", ri.get("avg_temp_c", 0.0))
+        details.setdefault("minutes_outside_range", ri.get("minutes_outside_range", 0))
+        details.setdefault("transit_phase", ri.get("transit_phase", "unknown"))
+        details.setdefault("spoilage_probability", ri.get("ml_spoilage_probability", 0.0))
+        details.setdefault("ml_prob", ri.get("ml_spoilage_probability", 0.0))
+        cost = ri.get("product_cost", {})
+        details.setdefault(
+            "at_risk_value",
+            float(cost.get("unit_cost_usd", 0)) * int(cost.get("units_per_shipment", 0)),
+        )
+        enriched["details"] = details
+
+    elif tool_name == "notification_agent":
         # Inject revised ETA
         revised_eta = _compute_revised_eta(ri)
         if revised_eta:
@@ -704,7 +731,8 @@ def compile_output(state: OrchestratorState) -> dict:
         "approval_reason": state.get("approval_reason", ""),
         "approval_id": state.get("approval_id"),
         "llm_reasoning": state.get("llm_reasoning", ""),
-        "cascade_context": {k: str(v)[:200] for k, v in state.get("cascade_context", {}).items()},
+        "cascade_context": state.get("cascade_context", {}),
+        "cascade_summary": {k: str(v)[:200] for k, v in state.get("cascade_context", {}).items()},
         "audit_log_summary": f"{total_count} tools executed, {len(errors)} errors, tier={tier}",
         "confidence": confidence,
         "timestamp": datetime.now(timezone.utc).isoformat(),
