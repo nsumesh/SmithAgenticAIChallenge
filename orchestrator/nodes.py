@@ -288,6 +288,19 @@ def _build_tool_input(tool_name: str, ri: dict, state: dict) -> dict:
             "justification": state.get("primary_issue", "") + context_suffix,
         }
 
+    if tool_name == "triage_agent":
+        return {
+            "shipments": [{
+                "shipment_id": ri.get("shipment_id", ""),
+                "container_id": ri.get("container_id", ""),
+                "risk_tier": ri.get("risk_tier", "LOW"),
+                "fused_risk_score": ri.get("fused_risk_score", 0.0),
+                "product_id": ri.get("product_type", ""),
+                "transit_phase": ri.get("transit_phase", ""),
+            }],
+            "enrich": True,
+        }
+
     return base
 
 
