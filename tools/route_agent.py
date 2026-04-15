@@ -209,43 +209,54 @@ def _call_groq_for_route(
 
     hours_str = f"{hours_to_breach:.1f} hours" if hours_to_breach is not None else "already breached"
 
-    prompt = f"""You are a pharmaceutical cold chain logistics specialist making an emergency route recommendation.
+    already_breached = hours_to_breach == 0.0 or hours_to_breach is None
+    urgency_instruction = (
+        "CRITICAL: Product is already in temperature excursion. "
+        "Prioritise the FASTEST certified option regardless of cost. "
+        "ETA change must be negative (faster than current route)."
+        if already_breached and risk_tier == "CRITICAL"
+        else "Choose the best balance of speed and cold chain certification."
+    )
 
-SHIPMENT CONTEXT:
-- Shipment ID: {shipment_id}
-- Product: {product_info['name']} (ID: {product_id})
-- Temperature class: {temp_class.upper()}
-- Required temp range: {product_info['temp_low']}°C to {product_info['temp_high']}°C
-- Freeze sensitive: {product_info['freeze_sensitive']}
-- Max allowed excursion: {product_info['max_excursion_min']} minutes
+    prompt = f"""You are a pharmaceutical cold chain logistics specialist making an emergency rerouting decision.
+
+IMPORTANT: You are recommending a CARRIER and TRANSPORT MODE for this shipment — not inventing a geographic route. The destination facility is fixed. Focus on which certified carrier can reach the destination fastest with the correct temperature controls.
+
+SHIPMENT:
+- ID: {shipment_id}
+- Product: {product_info.get('name', product_id)} ({product_id})
+- Temperature class: {temp_class.upper()} — must maintain {product_info.get('temp_low', 2)}°C to {product_info.get('temp_high', 8)}°C
+- Freeze sensitive: {product_info.get('freeze_sensitive', False)}
+- Max allowed excursion: {product_info.get('max_excursion_min', 60)} min
 - Risk tier: {risk_tier}
 - Transit phase: {transit_phase}
 
-CURRENT CONDITIONS:
-- Current average temp: {avg_temp}°C
-- Temperature trend: {temp_slope}°C/hr
+CURRENT BREACH STATUS:
+- Container temperature: {avg_temp}°C (slope: {temp_slope}°C/hr)
 - Time until breach: {hours_str}
 - Delay severity: {delay_class}
-- Active breach rules: {', '.join(rules_fired) if rules_fired else 'none'}
-- Reason for reroute: {reason}
+- Active rules: {', '.join(rules_fired) if rules_fired else 'none'}
+- Reason: {reason}
 
-DESTINATION WEATHER:
-- {weather_summary}
+DESTINATION:
+- Facility: {weather.get('facility_name', 'unknown')} ({weather.get('location', 'unknown')})
+- Current weather there: {weather_summary}
 
-PREFERRED MODE: {preferred_mode if preferred_mode else 'no preference — choose best option'}
+PREFERRED MODE: {preferred_mode if preferred_mode else 'choose best mode for this situation'}
 
-Based on this context, recommend the single best rerouting option. Consider:
-1. The product's temperature requirements and current breach status
-2. Whether severe weather at the destination affects air vs road choice
-3. The urgency given hours_to_breach and delay class
-4. Which certified carriers handle this temperature class
+URGENCY GUIDANCE: {urgency_instruction}
 
-Respond ONLY with a valid JSON object, no other text:
+For temperature class guidance:
+- FROZEN (-25 to -15°C): requires dry-ice or cryogenic-certified air freight (Atlas Air, Cargolux, Lufthansa Cargo)
+- REFRIGERATED (2-8°C): requires GDP-certified pharma lane (British Airways World Cargo, DHL Life Sciences, Marken)
+- CRT (10-25°C): standard temperature-controlled freight (DHL, FedEx Custom Critical, UPS Healthcare)
+
+Respond ONLY with valid JSON, no other text:
 {{
-  "recommended_route": "brief route description including key hubs and mode, e.g. FRA->LHR->JFK (air, GDP-certified cold chain)",
-  "carrier": "specific carrier name with certification relevant to this product",
-  "eta_change_hours": <integer, negative means faster, e.g. -3>,
-  "justification": "2-3 sentence explanation of why this route was chosen given the specific conditions above"
+  "recommended_route": "transport mode and key hub description, e.g. Air freight via LHR (GDP-certified pharma lane)",
+  "carrier": "specific carrier name with relevant certification",
+  "eta_change_hours": <integer — MUST be negative for CRITICAL already-breached shipments>,
+  "justification": "2-3 sentences explaining why this carrier and mode given the specific breach status, product requirements, and weather conditions"
 }}"""
 
     # Fallback routes by temp class in case API fails
