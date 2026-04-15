@@ -98,8 +98,11 @@ def _fetch_weather(facility: dict) -> dict:
     Returns a dict with weather context for the LLM.
     """
     # Try to get coordinates from facility record
-    # facilities.json uses location string not lat/lon — use city-level defaults
+    # facilities.json has city field (e.g. "London") and location string
+    # (e.g. "London Heathrow (LHR)") — prefer city for reliable matching
+    city_str = facility.get("city", "").lower()
     location_str = facility.get("location", "").lower()
+    search_str = city_str if city_str else location_str
     facility_name = facility.get("name", "unknown facility")
 
     # Map known facility locations to coordinates
@@ -119,7 +122,7 @@ def _fetch_weather(facility: dict) -> dict:
 
     lat, lon = 51.477, -0.461  # default to LHR if unknown
     for city, coords in location_coords.items():
-        if city in location_str:
+        if city in search_str:
             lat, lon = coords
             break
 
@@ -270,6 +273,7 @@ Respond ONLY with a valid JSON object, no other text:
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
             max_tokens=400,
+            timeout=15.0,
         )
 
         raw = response.choices[0].message.content.strip()
