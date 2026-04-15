@@ -289,18 +289,18 @@ Respond ONLY with valid JSON, no other text:
                 model=primary_model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
-                max_tokens=400,
+                max_tokens=600,
                 timeout=15.0,
             )
             model_used = primary_model
         except Exception as primary_exc:
             if "429" in str(primary_exc) or "rate_limit" in str(primary_exc).lower():
-                logger.warning("Primary model rate limited, trying mixtral fallback")
+                logger.warning("Primary model rate limited, trying %s fallback", fallback_model)
                 response = client.chat.completions.create(
                     model=fallback_model,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.3,
-                    max_tokens=400,
+                    max_tokens=600,
                     timeout=15.0,
                 )
                 model_used = fallback_model
@@ -313,6 +313,9 @@ Respond ONLY with valid JSON, no other text:
             raw = raw.split("```")[1]
             if raw.startswith("json"):
                 raw = raw[4:]
+        # Repair truncated JSON — if token limit cut off the closing brace, add it back
+        if raw and not raw.endswith("}"):
+            raw = raw.rstrip().rstrip(",") + "}"
         result = json.loads(raw)
 
         # Validate required keys
