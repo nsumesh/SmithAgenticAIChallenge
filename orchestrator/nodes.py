@@ -618,7 +618,7 @@ def execute(state: OrchestratorState) -> dict:
       gets a warning injected but still runs (with degraded inputs).
     - If cold_storage_agent finds no facility, notification_agent's message
       is adjusted to reflect that.
-    - approval_workflow runs last regardless.
+    - approval_workflow is SKIPPED here (handled by approval_gate node).
     """
     active = state.get("active_plan") or state.get("draft_plan", [])
     ri = state.get("risk_input", {})
@@ -635,6 +635,8 @@ def execute(state: OrchestratorState) -> dict:
         tool_name = step.get("tool", "")
         if not tool_name:
             errors.append("Step missing 'tool' key")
+            continue
+        if tool_name == "approval_workflow":
             continue
         base_input = step.get("tool_input", {})
 
@@ -725,9 +727,19 @@ def compile_output(state: OrchestratorState) -> dict:
     success_count = sum(1 for r in tool_results if r.get("success"))
     total_count = len(tool_results)
 
+    awaiting = state.get("awaiting_approval", False)
+
     if tier == "LOW":
         summary = "Monitoring only. All metrics within acceptable range."
         confidence = 0.95
+    elif awaiting:
+        plan = state.get("active_plan") or state.get("draft_plan", [])
+        tool_names = [s.get("tool", "?") for s in plan if isinstance(s, dict)]
+        summary = (
+            f"{tier} risk detected. Agentic plan generated with {len(tool_names)} tools: "
+            f"{', '.join(tool_names)}. Awaiting human approval before execution."
+        )
+        confidence = 0.75
     elif total_count == 0:
         summary = f"{tier} risk detected but no tools executed. Manual intervention required."
         confidence = 0.3
@@ -764,8 +776,11 @@ def compile_output(state: OrchestratorState) -> dict:
         ],
         "fallback_plan": _steps_to_dicts(state.get("fallback_plan")),
         "requires_approval": state.get("requires_approval", False),
+        "awaiting_approval": state.get("awaiting_approval", False),
         "approval_reason": state.get("approval_reason", ""),
         "approval_id": state.get("approval_id"),
+        "proposed_tools": [s.get("tool", "") for s in (state.get("active_plan") or state.get("draft_plan", []))
+                           if isinstance(s, dict) and s.get("tool") != "approval_workflow"],
         "llm_reasoning": state.get("llm_reasoning", ""),
         "cascade_context": state.get("cascade_context", {}),
         "cascade_summary": {k: str(v)[:200] for k, v in state.get("cascade_context", {}).items()},

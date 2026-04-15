@@ -265,7 +265,10 @@ which tools to call AND constructs the tool input payloads -- it is not a
 template executor.
 
 ```
-interpret → plan(LLM) → reflect(LLM) → [revise(LLM) if gaps] → execute → observe(LLM) → [replan?] → fallback → output
+interpret → plan(LLM) → reflect(LLM) → [revise(LLM)] → approval_gate
+  MEDIUM:        → execute → observe(LLM) → [replan?] → output (automatic)
+  HIGH/CRITICAL: → output (plan-only, awaiting human approval)
+  After approval: execute approved tools → observe → output
 ```
 
 ### Orchestration Nodes
@@ -279,6 +282,7 @@ interpret → plan(LLM) → reflect(LLM) → [revise(LLM) if gaps] → execute �
 | **reflect** | Deterministic fallback | 5-point checklist |
 | **revise** | **Agentic** (Groq LLM) | LLM rewrites plan to fix all gaps, deduplicates tools |
 | **revise** | Deterministic fallback | Keyword scan on GAP notes, inserts missing tools |
+| **approval_gate** | Deterministic | Pauses pipeline for HIGH/CRITICAL; creates approval with proposed tools. MEDIUM auto-continues to execute |
 | **execute** | Deterministic | Result-aware cascade execution with dependency tracking (`failed_tools`, `_DEPENDS_ON` map) |
 | **observe** | **Agentic** (Groq LLM) | Inspects execution results, triggers re-plan for CRITICAL failures (max 1 loop) |
 | **fallback** | Deterministic | Minimal backup plan if execution had errors |
@@ -298,16 +302,16 @@ During execution, each tool's output enriches inputs to downstream tools:
 
 ### Human-in-the-Loop Approval Flow
 
-The approval workflow ensures human control over irreversible actions:
+The system implements a **plan-first** HITL pattern — tools only execute after human review:
 
-1. **Orchestration runs** -- LLM plans and executes tools, including `approval_workflow`
-2. **Approval created** -- Dashboard shows pending request in Approvals tab
-3. **Operator decides** -- Approve or reject; can select specific tools to run
-4. **Post-approval execution** -- `run_orchestrator_selective()` bypasses the LangGraph
-   entirely (no LLM plan overwrite), running only the approved tools. The
-   `approval_workflow` tool is automatically excluded to prevent ghost approvals.
-5. **History updated** -- Original entry replaced in-place (no duplicate rows)
-6. **WebSocket sync** -- Agent Activity updates in real-time via `approval_executed` events
+1. **Orchestration triggered** — LLM generates plan, reflects, revises (full agentic pipeline)
+2. **Approval gate** — HIGH/CRITICAL events pause here. The plan and proposed tools are stored.
+   MEDIUM events skip the gate and auto-execute.
+3. **Human reviews plan** — Dashboard shows the LLM's proposed tools and reasoning
+4. **Operator decides** — Approve (with optional tool selection) or reject
+5. **Post-approval execution** — `run_orchestrator_selective()` executes only the approved
+   tools. Tools run exactly once — never before approval.
+6. **Observe + Output** — LLM inspects results, history updated in-place via WebSocket
 
 ### RAG Compliance Agent
 

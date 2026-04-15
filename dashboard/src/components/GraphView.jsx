@@ -49,14 +49,17 @@ const SYSTEM_MERMAID = `graph TB
     plan["📝 Plan (Groq LLM)<br/>llama-3.3-70b-versatile<br/>tool selection + input construction"]
     reflect["🪞 Reflect (LLM)<br/>self-critique draft plan<br/>identify gaps & missing tools"]
     revise["🔄 Revise (LLM)<br/>LLM rewrites plan<br/>fills all gaps from reflection"]
+    gate["🚦 Approval Gate<br/>HIGH/CRITICAL → pause for human<br/>MEDIUM → auto-execute"]
     execute["▶ Execute Tools<br/>result-aware cascade<br/>dependency tracking"]
     observe["👁 Observe (LLM)<br/>inspect execution results<br/>decide if re-plan needed"]
     output["📊 Compile Output<br/>decision summary<br/>confidence + audit trail"]
     interpret -->|"risk_input<br/>+ context"| plan
     plan -->|"draft_plan<br/>steps + inputs"| reflect
     reflect -->|"GAP found"| revise
-    reflect -->|"plan OK"| execute
-    revise -->|"revised<br/>plan"| execute
+    reflect -->|"plan OK"| gate
+    revise -->|"revised<br/>plan"| gate
+    gate -->|"MEDIUM<br/>auto-execute"| execute
+    gate -->|"HIGH/CRITICAL<br/>plan-only"| output
     execute -->|"tool results"| observe
     observe -->|"adequate"| output
     observe -->|"issues found<br/>(CRITICAL only)"| plan
@@ -107,6 +110,7 @@ const SYSTEM_MERMAID = `graph TB
   class fe,det,ml,fusion risk
   class interpret,execute,output orch
   class plan,reflect,revise,observe llm
+  class gate human
   class t_comply,t_route,t_cold,t_notify,t_sched,t_insure,t_triage,t_approve tools
   class dash,approve_q,selective,ws human`;
 

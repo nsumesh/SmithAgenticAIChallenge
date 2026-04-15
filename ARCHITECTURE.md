@@ -114,25 +114,28 @@
 │  ┌─────────────────────────────────────────────────────────────────────────┐       │
 │  │                         GRAPH TOPOLOGY                                  │       │
 │  │                                                                         │       │
-│  │  ┌───────────┐    ┌──────┐    ┌─────────┐    ┌────────┐               │       │
-│  │  │ interpret  │───→│ plan │───→│ reflect │───→│ revise │               │       │
-│  │  └───────────┘    └──────┘    └────┬────┘    └───┬────┘               │       │
-│  │       ▲                            │             │                     │       │
-│  │       │                ┌───────────┘             │                     │       │
-│  │       │                │  (conditional)          │                     │       │
-│  │       │                ▼                         ▼                     │       │
-│  │       │           LOW → output         ┌─────────┐    ┌─────────┐    │       │
-│  │       │           GAP → revise         │ execute  │───→│ observe │    │       │
-│  │       │           OK  → execute        └─────────┘    └────┬────┘    │       │
-│  │       │                                     (conditional)  │          │       │
-│  │       │                                                    ▼          │       │
-│  │       │  (replan_bridge, if CRITICAL + failures)    adequate?         │       │
-│  │       └───────────── YES ◄─────────────────────     │                │       │
-│  │                                              ┌──────┘                │       │
-│  │                                              ▼                        │       │
-│  │                                   ┌──────────┐    ┌────────┐         │       │
-│  │                                   │ fallback  │───→│ output │──→END  │       │
-│  │                                   └──────────┘    └────────┘         │       │
+│  │  ┌───────────┐    ┌──────┐    ┌─────────┐    ┌────────┐    ┌────────────────┐   │       │
+│  │  │ interpret  │───→│ plan │───→│ reflect │───→│ revise │───→│ approval_gate  │   │       │
+│  │  └───────────┘    └──────┘    └────┬────┘    └───┬────┘    └───────┬────────┘   │       │
+│  │       ▲                            │             │                 │            │       │
+│  │       │                ┌───────────┘             │                 │            │       │
+│  │       │                │  (conditional)          │                 │            │       │
+│  │       │                ▼                         ▼                 ▼            │       │
+│  │       │           LOW → output         MEDIUM → execute    HIGH/CRIT → output   │       │
+│  │       │           GAP → revise          │         │        (plan-only)        │       │
+│  │       │           OK  → approval_gate ──┘         │                           │       │
+│  │       │                                     ┌───────┴───┐    ┌─────────┐        │       │
+│  │       │                                     │ execute  │───→│ observe │        │       │
+│  │       │                                     └──────────┘    └────┬────┘        │       │
+│  │       │                                     (conditional)        │             │       │
+│  │       │                                                          ▼             │       │
+│  │       │  (replan_bridge, if CRITICAL + failures)    adequate?                   │       │
+│  │       └───────────── YES ◄─────────────────────     │                           │       │
+│  │                                              ┌──────┘                           │       │
+│  │                                              ▼                                 │       │
+│  │                                   ┌──────────┐    ┌────────┐                   │       │
+│  │                                   │ fallback  │───→│ output │──→END            │       │
+│  │                                   └──────────┘    └────────┘                   │       │
 │  └─────────────────────────────────────────────────────────────────────────┘       │
 │                                                                                    │
 │  NODE DETAIL (see Section 5 below for full I/O)                                    │
@@ -849,10 +852,13 @@ orchestrator/graph.py :: _should_revise(state)  +  _should_replan(state)
          │   └── YES → "skip_to_output"  (no action plan needed)
          │
          ├── any note contains "GAP" AND not already revised ?
-         │   └── YES → "revise"  (patch the plan, then execute)
+         │   └── YES → "revise"  (patch the plan, then approval_gate)
          │
          └── otherwise
-             └── "execute"  (plan is good, run it)
+             └── "approval_gate"  (plan is good; tiered execute vs plan-only)
+
+  approval_gate ──→ execute          (MEDIUM tier: auto-execute)
+  approval_gate ──→ plan_only_output (HIGH/CRITICAL: pause for human)
 
   ┌──────────────┐
   │   observe     │
@@ -868,6 +874,8 @@ orchestrator/graph.py :: _should_revise(state)  +  _should_replan(state)
 ---
 
 ## 8. Cascade Data Flow Example (CRITICAL Tier)
+
+**Plan-first HITL:** For CRITICAL tier, steps 1–6 below run only **after** human approval. The initial orchestration pass produces the plan (and pending approval); tool execution happens in `run_orchestrator_selective()` once the operator approves.
 
 ```
 Step 1: compliance_agent

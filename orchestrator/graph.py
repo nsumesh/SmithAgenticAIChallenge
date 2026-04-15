@@ -1,17 +1,15 @@
 """
 Advanced orchestration agent -- LangGraph StateGraph.
 
-Graph topology (with observation loop):
-  interpret → plan → reflect → [revise] → execute → observe → [re-plan?] → output
+Graph topology (plan-first HITL):
+  interpret → plan → reflect → [revise] → approval_gate
+                                            ├── LOW/MEDIUM: execute → observe → [re-plan?] → output
+                                            └── HIGH/CRITICAL: output (plan-only, awaiting human)
 
-The observation loop allows the agent to inspect execution results and
-re-plan if critical tools failed (max 1 re-plan to avoid infinite loops).
+  After human approves: run_orchestrator_selective() does the real execution.
 
-Agentic mode (when any LLM provider is available):
-  plan, reflect, revise, and observe nodes use the LLM.
-
-Deterministic fallback:
-  If no LLM provider is available or CARGO_LLM_ENABLED=0, all nodes are template-based.
+The approval gate ensures tools only run ONCE — after human review for
+HIGH/CRITICAL events. LOW/MEDIUM events execute automatically.
 """
 
 from __future__ import annotations
@@ -102,6 +100,54 @@ def _should_revise(state: OrchestratorState) -> str:
 
     if has_gaps and not already_revised:
         return "revise"
+    return "approval_gate"
+
+
+def _approval_gate(state: OrchestratorState) -> dict:
+    """Decide whether to pause for human approval or auto-execute.
+
+    HIGH/CRITICAL → creates an approval request and STOPS (no tool execution).
+    MEDIUM → proceeds to execute automatically.
+    """
+    tier = state["risk_input"].get("risk_tier", "MEDIUM")
+    requires = tier in ("HIGH", "CRITICAL")
+
+    if requires:
+        from tools.approval_workflow import _execute as create_approval
+        ri = state["risk_input"]
+        active = state.get("active_plan") or state.get("draft_plan", [])
+        proposed = [s.get("tool", "") for s in active if isinstance(s, dict) and s.get("tool") != "approval_workflow"]
+
+        result = create_approval(
+            shipment_id=ri.get("shipment_id", ""),
+            action_description=f"{tier} risk event: {state.get('primary_issue', 'unknown')}",
+            risk_tier=tier,
+            urgency="immediate" if tier == "CRITICAL" else "urgent",
+            proposed_actions=proposed,
+            justification=state.get("llm_reasoning", "Agentic plan requires human review"),
+            requested_by="orchestrator",
+            window_id=ri.get("window_id"),
+            container_id=ri.get("container_id"),
+        )
+        logger.info("APPROVAL_GATE  tier=%s → paused, approval_id=%s, proposed=%s",
+                     tier, result.get("approval_id"), proposed)
+        return {
+            "requires_approval": True,
+            "approval_reason": f"{tier} risk requires human review before tool execution",
+            "approval_id": result.get("approval_id"),
+            "awaiting_approval": True,
+        }
+    else:
+        return {
+            "requires_approval": False,
+            "awaiting_approval": False,
+        }
+
+
+def _after_approval_gate(state: OrchestratorState) -> str:
+    """Route after the approval gate: execute or stop."""
+    if state.get("awaiting_approval"):
+        return "plan_only_output"
     return "execute"
 
 
@@ -133,7 +179,15 @@ def _replan_increment(state: OrchestratorState) -> dict:
 
 
 def build_orchestrator() -> StateGraph:
-    """Construct the orchestration StateGraph with observation loop."""
+    """Construct the orchestration StateGraph with plan-first HITL.
+
+    Topology:
+      interpret → plan → reflect ─┬─ GAP → revise → approval_gate
+                                   ├─ OK  → approval_gate
+                                   └─ LOW → output (skip)
+      approval_gate ─┬─ HIGH/CRITICAL → output (plan-only, awaiting approval)
+                     └─ MEDIUM       → execute → observe → [replan?] → output
+    """
     graph = StateGraph(OrchestratorState)
 
     plan_node = _get_plan_node()
@@ -145,6 +199,7 @@ def build_orchestrator() -> StateGraph:
     graph.add_node("plan", plan_node)
     graph.add_node("reflect", reflect_node)
     graph.add_node("revise", revise_node)
+    graph.add_node("approval_gate", _approval_gate)
     graph.add_node("execute", execute)
     graph.add_node("observe", observe_node)
     graph.add_node("replan_bridge", _replan_increment)
@@ -158,10 +213,17 @@ def build_orchestrator() -> StateGraph:
     graph.add_conditional_edges(
         "reflect",
         _should_revise,
-        {"revise": "revise", "execute": "execute", "skip_to_output": "output"},
+        {"revise": "revise", "approval_gate": "approval_gate", "skip_to_output": "output"},
     )
 
-    graph.add_edge("revise", "execute")
+    graph.add_edge("revise", "approval_gate")
+
+    graph.add_conditional_edges(
+        "approval_gate",
+        _after_approval_gate,
+        {"execute": "execute", "plan_only_output": "output"},
+    )
+
     graph.add_edge("execute", "observe")
 
     graph.add_conditional_edges(

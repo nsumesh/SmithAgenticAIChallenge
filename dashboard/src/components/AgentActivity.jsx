@@ -327,13 +327,25 @@ function PipelineSteps({ decision }) {
   const d = decision || {};
   const replanned = (d.replan_count || 0) > 0;
   const isPostApproval = d._execution_mode === 'post_approval' || d._execution_mode === 'human_selective';
+  const isAwaitingApproval = d.awaiting_approval && !isPostApproval;
 
   const steps = isPostApproval ? [
     { label: 'Interpret', done: true, icon: Activity },
-    { label: 'Human Plan', done: true, icon: Brain, special: true },
+    { label: 'Plan', done: true, icon: Brain },
+    { label: 'Reflect', done: true, icon: Cpu },
+    { label: 'Revise', done: true, icon: Zap },
+    { label: 'Approved', done: true, icon: Shield, special: true },
     { label: 'Execute', done: Array.isArray(d.actions_taken) && d.actions_taken.length > 0, icon: Play },
     { label: 'Observe', done: !!d.observation, icon: Eye },
     { label: 'Output', done: !!d.decision_summary, icon: CheckCircle },
+  ] : isAwaitingApproval ? [
+    { label: 'Interpret', done: true, icon: Activity },
+    { label: 'Plan', done: true, icon: Brain },
+    { label: 'Reflect', done: true, icon: Cpu },
+    { label: 'Revise', done: Array.isArray(d.revised_plan) && d.revised_plan.length > 0, icon: Zap },
+    { label: 'Approval Gate', done: true, icon: Shield, special: true },
+    { label: 'Execute', done: false, icon: Play },
+    { label: 'Output', done: false, icon: CheckCircle },
   ] : [
     { label: 'Interpret', done: true, icon: Activity },
     { label: 'Plan', done: Array.isArray(d.draft_plan) && d.draft_plan.length > 0, icon: Brain },
@@ -633,11 +645,15 @@ function renderActions(actionsTaken, decisionMeta) {
 function DecisionCard({ decision, expanded, onToggle }) {
   const d = decision || {};
   const actionsCount = Array.isArray(d.actions_taken) ? d.actions_taken.length : 0;
-  const approvalStatus = d._approval_status || (d._execution_mode === 'post_approval' ? 'executed' : null);
   const isPostApproval = d._execution_mode === 'post_approval';
+  const isAwaitingApproval = d.awaiting_approval && !isPostApproval;
 
   return (
-    <div className={`glass-card overflow-hidden ${isPostApproval ? 'ring-1 ring-emerald-500/20' : ''}`}>
+    <div className={`glass-card overflow-hidden ${
+      isPostApproval ? 'ring-1 ring-emerald-500/20'
+      : isAwaitingApproval ? 'ring-1 ring-amber-500/20'
+      : ''
+    }`}>
       <div role="button" tabIndex={0} className="px-5 py-3.5 flex items-center gap-3 cursor-pointer hover:bg-white/[0.02] transition" onClick={onToggle} onKeyDown={e => e.key === 'Enter' && onToggle()}>
         <TierBadge tier={d.risk_tier || 'LOW'} />
         <div className="min-w-0">
@@ -647,20 +663,19 @@ function DecisionCard({ decision, expanded, onToggle }) {
         <div className="ml-auto flex items-center gap-3 shrink-0">
           {actionsCount > 0 && <span className="flex items-center gap-1 text-xs text-emerald-400"><CheckCircle className="w-3.5 h-3.5" />{actionsCount} tools</span>}
 
-          {/* Approval status badges */}
           {isPostApproval && (
             <span className="flex items-center gap-1 px-2 py-0.5 rounded-lg text-[10px] font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
               <CheckCircle className="w-3 h-3" /> Approved & Executed
             </span>
           )}
-          {approvalStatus === 'approved' && !isPostApproval && (
-            <span className="flex items-center gap-1 px-2 py-0.5 rounded-lg text-[10px] font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-              <CheckCircle className="w-3 h-3" /> Approved
+          {isAwaitingApproval && (
+            <span className="flex items-center gap-1 px-2 py-0.5 rounded-lg text-[10px] font-bold bg-amber-500/10 text-amber-400 border border-amber-500/20">
+              <Shield className="w-3 h-3" /> Plan Ready — Awaiting Approval
             </span>
           )}
-          {d.requires_approval && !approvalStatus && (
-            <span className="flex items-center gap-1 px-2 py-0.5 rounded-lg text-[10px] font-bold bg-amber-500/10 text-amber-400 border border-amber-500/20">
-              <Shield className="w-3 h-3" /> Awaiting Approval
+          {!isPostApproval && !isAwaitingApproval && actionsCount === 0 && d.risk_tier !== 'LOW' && (
+            <span className="flex items-center gap-1 px-2 py-0.5 rounded-lg text-[10px] font-bold bg-slate-500/10 text-slate-400 border border-slate-500/20">
+              Auto-Executed
             </span>
           )}
 
@@ -677,8 +692,26 @@ function DecisionCard({ decision, expanded, onToggle }) {
               <span className="text-emerald-400 font-medium">
                 Approved by {safeStr(d._approved_by)}
                 {d._approved_at && <span className="text-emerald-400/50 ml-1">at {new Date(d._approved_at).toLocaleString()}</span>}
-                {' '}&mdash; re-orchestrated after human approval
+                {' '}&mdash; tools executed after human approval
               </span>
+            </div>
+          )}
+          {isAwaitingApproval && (
+            <div className="bg-amber-500/5 border border-amber-500/10 rounded-lg px-3 py-2 space-y-2">
+              <div className="flex items-center gap-2 text-[11px]">
+                <Shield className="w-3.5 h-3.5 text-amber-400" />
+                <span className="text-amber-400 font-medium">
+                  Plan generated by LLM — no tools have executed yet. Go to Approvals tab to review and execute.
+                </span>
+              </div>
+              {Array.isArray(d.proposed_tools) && d.proposed_tools.length > 0 && (
+                <div className="flex flex-wrap gap-1.5">
+                  <span className="text-[10px] text-slate-500 mr-1">Proposed:</span>
+                  {d.proposed_tools.map(t => (
+                    <span key={t} className="bg-amber-500/10 text-amber-400 text-[10px] px-2 py-0.5 rounded border border-amber-500/15">{t}</span>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 

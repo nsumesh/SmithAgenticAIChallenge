@@ -37,12 +37,19 @@ export default function Approvals() {
     if (wsMessages.length > 0) refetch();
   }, [wsMessages, refetch]);
 
-  const handleDecide = useCallback(async (id, decision) => {
+  const handleDecide = useCallback(async (id, decision, proposedActions) => {
     setActionInFlight(id);
     try {
       const result = await postApi(`/approvals/${id}/decide`, { decision, decided_by: 'operator' });
       if (result?.error) {
         console.error('Decide failed:', result.error);
+      }
+      if (decision === 'approved' && Array.isArray(proposedActions)) {
+        const validTools = ALL_TOOLS.map(t => t.id);
+        const preSelected = proposedActions.filter(t => validTools.includes(t) && t !== 'approval_workflow');
+        if (preSelected.length > 0) {
+          setSelectedTools(prev => ({ ...prev, [id]: preSelected }));
+        }
       }
       await refetch();
     } catch (e) {
@@ -171,10 +178,12 @@ export default function Approvals() {
         return (
           <div key={a.approval_id} className={`glass-card p-5 space-y-3 animate-slide-up ${isRejected ? 'opacity-60' : ''}`}
             style={{ animationDelay: `${i * 80}ms` }}>
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-3 flex-wrap">
               <TierBadge tier={a.risk_tier} size="lg" />
               <span className="font-semibold text-white">{a.approval_id}</span>
-              <span className="text-xs text-slate-500">Shipment {a.shipment_id}</span>
+              <span className="text-xs text-slate-500">
+                {a.window_id || a.shipment_id}{a.container_id ? ` / ${a.container_id}` : ''}
+              </span>
 
               {/* Status badge */}
               <span className={`flex items-center gap-1 px-2.5 py-1 rounded-lg text-[10px] font-bold border ${style.bg} ${style.text} ${style.border}`}>
@@ -206,12 +215,12 @@ export default function Approvals() {
             {/* Pending: show Approve / Reject buttons */}
             {isPending && (
               <div className="flex gap-3 pt-3 border-t border-white/[0.06]">
-                <button onClick={() => handleDecide(a.approval_id, 'approved')}
+                <button onClick={() => handleDecide(a.approval_id, 'approved', a.proposed_actions)}
                   disabled={actionInFlight === a.approval_id}
                   className="flex items-center gap-1.5 px-5 py-2.5 bg-gradient-to-r from-emerald-600 to-green-600 text-white rounded-xl text-sm font-semibold hover:from-emerald-500 hover:to-green-500 disabled:opacity-50 transition-all shadow-lg shadow-emerald-500/15">
                   <CheckCircle className="w-4 h-4" /> Approve
                 </button>
-                <button onClick={() => handleDecide(a.approval_id, 'rejected')}
+                <button onClick={() => handleDecide(a.approval_id, 'rejected', null)}
                   disabled={actionInFlight === a.approval_id}
                   className="flex items-center gap-1.5 px-5 py-2.5 bg-gradient-to-r from-red-600 to-rose-600 text-white rounded-xl text-sm font-semibold hover:from-red-500 hover:to-rose-500 disabled:opacity-50 transition-all shadow-lg shadow-red-500/15">
                   <XCircle className="w-4 h-4" /> Reject

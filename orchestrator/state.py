@@ -51,6 +51,7 @@ class OrchestratorState(TypedDict, total=False):
     requires_approval: bool
     approval_reason: str
     approval_id: Optional[str]
+    awaiting_approval: bool        # True when plan is ready but execution is paused
 
     # ── Cascade ──
     cascade_context: Dict[str, Any]   # keyed by tool_name; accumulates results during execute

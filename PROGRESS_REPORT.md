@@ -49,8 +49,10 @@ SUPABASE CLOUD
            │
            ▼
   orchestrator/graph.py        → LangGraph StateGraph
-  interpret → plan(LLM) → reflect(LLM) → [revise(LLM)] → execute
-                                                            → observe(LLM) → [replan] → output
+  interpret → plan(LLM) → reflect(LLM) → [revise(LLM)] → approval_gate
+                                              ├── MEDIUM: execute → observe → output (auto)
+                                              └── HIGH/CRITICAL: output (plan-only, awaiting human)
+  After approval: run_orchestrator_selective → execute → observe → output
            │
            │  execute() calls tools sequentially with cascade enrichment
            ▼
@@ -147,6 +149,7 @@ CASCADE ENRICHMENT:
 | **reflect** | `nodes.py :: reflect()` | Deterministic | 5-point checklist: compliance_covered, notification_included, approval_for_irreversible, has_fallback, no_empty_steps | `reflection_notes` |
 | **revise** | `llm_nodes.py :: revise_llm()` | **Agentic** (Groq) | LLM rewrites full plan + `tool_input` from draft + reflection gaps; falls back to deterministic revise if LLM disabled or malformed. | `revised_plan, active_plan, plan_revised` |
 | **revise** | `nodes.py :: revise()` | Deterministic | Keyword scan on GAP notes → inserts missing tools (compliance at pos 0, approval last, others appended). Supports: compliance, notification, insurance, cold_storage, scheduling, approval | `revised_plan, active_plan, plan_revised` |
+| **approval_gate** | `graph.py :: _approval_gate()` | Deterministic | Creates approval request and PAUSES pipeline for HIGH/CRITICAL. MEDIUM proceeds to execute. Stores proposed tools from the plan. | `requires_approval, approval_id, awaiting_approval` |
 | **execute** | `nodes.py :: execute()` | Deterministic | Sequential tool invocation with cascade enrichment; `_DEPENDS_ON`-aware warnings when upstream tools fail; `failed_tools` tracking; per-tool errors do not abort the chain. | `tool_results, execution_errors, cascade_context, approval_id` |
 | **observe** | `llm_nodes.py :: observe_llm()` | **Agentic** (Groq) | LLM inspects execution results, decides if re-planning is needed for CRITICAL failures. | `observation, needs_replan, observation_issues, observation_actions` |
 | **fallback** | `nodes.py :: build_fallback()` | Deterministic | Minimal backup: notification_agent + compliance_agent | `fallback_plan` |
@@ -156,9 +159,11 @@ CASCADE ENRICHMENT:
 
 ```
 reflect ──→ revise          (if "GAP" found in notes AND not already revised)
-reflect ──→ execute         (if plan passes all checks)
+reflect ──→ approval_gate   (if plan passes all checks)
 reflect ──→ output          (if tier is LOW → skip everything)
-observe ──→ replan_bridge   (if needs_replan=True AND replan_count < MAX_REPLAN=1, CRITICAL only)
+approval_gate ──→ execute   (MEDIUM tier: auto-execute)
+approval_gate ──→ output    (HIGH/CRITICAL: plan-only, awaiting human approval)
+observe ──→ replan_bridge   (if needs_replan=True AND replan_count < 1, CRITICAL only)
 observe ──→ fallback→output (otherwise — finalize results)
 ```
 
@@ -338,7 +343,7 @@ Compliance Agent Workflow:
 | 8 | **Streaming bridge was still pointed at old `telemetry` table** — `stream_listener.py` and `simulate_stream.py` would miss new `window_features` inserts | HIGH | Fixed |
 | 9 | **`shock_count` 99.7% zeros / `door_open_count` 99.8% zeros** in data | LOW | Open (improve data generation) |
 | 10 | **Approval workflow is in-memory** — pending approvals lost on server restart | LOW | Open (persist to Supabase) |
-| 11 | **Approval→execution gap** — ~~when operator approves, nothing happens~~ `POST /api/approvals/{id}/execute` re-runs orchestration with approved context. WebSocket broadcasts `approval_executed` events. Agent Activity and Approvals tabs now sync via `useWebSocket` hook. | HIGH | **Fixed** |
+| 11 | **Approval→execution gap** — ~~when operator approves, nothing happens~~ Plan-first HITL: HIGH/CRITICAL stop at `approval_gate` with plan-only output; `POST /api/approvals/{id}/execute` runs `run_orchestrator_selective` so tools run **once** after approval (no double-execution; `approval_workflow` is not part of the automated execute chain). WebSocket broadcasts `approval_executed` events. Agent Activity and Approvals tabs sync via `useWebSocket` hook. | HIGH | **Fixed** |
 | 12 | **No human tool selection** — ~~operator can only approve/reject~~ Approvals page now has toggle buttons for each tool. Operator can select specific tools before clicking Execute. `run_orchestrator_selective()` runs only the chosen tools. | MEDIUM | **Fixed** |
 | 13 | **Execute node is fire-and-forget** — ~~runs all tools sequentially without checking~~ Execute now tracks `failed_tools` set, injects warnings into downstream tools when upstream dependencies fail (e.g. cold_storage→notification), and uses `_DEPENDS_ON` map for dependency awareness. | MEDIUM | **Fixed** |
 | 14 | **Single-iteration plan-reflect loop** — ~~graph never loops back after execution~~ Observe node (LLM-powered) inspects execution results and triggers re-plan for CRITICAL events if tools failed. Max 1 re-plan iteration to prevent infinite loops. | HIGH | **Fixed** |
@@ -363,6 +368,7 @@ LLM is the brain, the tools are the hands. But we need to be precise about limit
 - `reflect_llm()` — LLM critiques its own plan against GDP/FDA compliance (self-correction)
 - `revise_llm()` — LLM rewrites the plan to fix all gaps from reflection (LLM plan editing)
 - `observe_llm()` — LLM inspects execution results and decides if re-planning is needed (feedback loop)
+- `_approval_gate()` — creates approval and pauses execution for human review (HITL gate)
 - `compliance_agent` — RAG semantic search + LLM interprets real regulations (novel judgments)
 - `route_agent` — LLM evaluates trade-offs among pre-filtered safe candidates
 
@@ -653,3 +659,6 @@ These are genuine improvements for future iterations.
 | **Post-approval execution skips approval_workflow** | **Selective runner bypasses graph, 0 ghost approvals created, history entry replaced in-place** |
 | **Approval card reflects decided status** | **ApprovalResult shows APPROVED badge + operator name when entry is approved** |
 | **run_orchestrator_selective bypasses graph** | **Direct interpret→execute→observe→compile, no LLM plan overwrite of human selections** |
+| **Plan-first HITL (CRITICAL)** | **Plan-only output: 0 tools executed, awaiting_approval=True, 5 proposed tools, LLM reasoning captured** |
+| **Plan-first HITL (MEDIUM)** | **Auto-executed: 2 tools (compliance + notification), no approval gate, no approval_workflow tool** |
+| **Tools execute exactly once** | **CRITICAL: tools run only after human approval. No double-execution. approval_workflow removed from tool chain** |

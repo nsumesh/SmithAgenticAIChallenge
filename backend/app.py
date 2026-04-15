@@ -343,17 +343,16 @@ async def execute_approved(approval_id: str, body: Dict[str, Any] = None):
     decision["_execution_mode"] = "post_approval"
     decision["_approved_by"] = record.get("decided_by", "operator")
     decision["_approved_at"] = record.get("decided_at", "")
+    decision["awaiting_approval"] = False
 
     replaced = False
     for i, old in enumerate(_orchestrator_history):
         old_wid = old.get("_window_id") or old.get("window_id", "")
-        old_aid = None
-        for at in old.get("actions_taken", []):
-            if isinstance(at, dict) and at.get("tool") == "approval_workflow":
-                r = at.get("result", {})
-                if isinstance(r, dict):
-                    old_aid = r.get("approval_id")
-        if old_aid == approval_id or (old_wid == window_id and old.get("requires_approval")):
+        old_aid = old.get("approval_id")
+        if old_aid == approval_id or (old_wid == window_id and old.get("awaiting_approval")):
+            for key in ("draft_plan", "reflection_notes", "revised_plan", "llm_reasoning", "proposed_tools"):
+                if key in old and old[key]:
+                    decision[key] = old[key]
             _orchestrator_history[i] = decision
             replaced = True
             break
