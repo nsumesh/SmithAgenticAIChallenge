@@ -17,9 +17,8 @@ fastapi>=0.115
 uvicorn>=0.34
 httpx>=0.28
 supabase>=2.9.0
-sentence-transformers==2.3.1
+sentence-transformers==2.3.1; sys_platform != "linux"
 pypdf>=4.0.1
 python-dotenv>=1.0.0
 groq>=0.30.0,<1.0.0
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.2.0+cpu
+torch==2.2.0; sys_platform != "linux"

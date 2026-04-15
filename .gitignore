@@ -21,7 +21,7 @@ env/
 .DS_Store
 
 # Generated artifacts (large binary files)
-artifacts/xgb_spoilage.joblib
+# xgb_spoilage.joblib is committed so Railway doesn't need to retrain on deploy
 
 # Runtime audit logs (generated on each run)
 audit_logs/compliance_events.jsonl
