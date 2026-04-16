@@ -321,134 +321,152 @@ REFLECTION_CHECKLIST = [
 
 
 def reflect(state: OrchestratorState) -> dict:
-    """Critique the draft plan against feasibility and compliance checklist."""
-    tier = state["risk_input"].get("risk_tier", "LOW")
-    if tier == "LOW":
-        return {"reflection_notes": ["LOW risk: no action plan needed. Monitoring only."]}
+    """Post-execution reflection: check tool results against requirements AND quality.
 
-    plan_to_check = state.get("draft_plan", [])
+    notification_agent is always deferred to post-approval, so it is excluded
+    from mandatory-tool gap checks (it will be proposed in revise).
+    """
+    ri = state["risk_input"]
+    tier = ri.get("risk_tier", "LOW")
+    if tier == "LOW":
+        return {"reflection_notes": ["LOW risk: monitoring only."], "needs_revision": False}
+
+    tool_results = state.get("tool_results", [])
+    deferred = set(state.get("deferred_tools", []))
+    executed = {r["tool"] for r in tool_results}
+    failed = {r["tool"] for r in tool_results if not r.get("success")}
+    result_map = {r["tool"]: r.get("result", {}) for r in tool_results}
     notes: List[str] = []
 
-    for check_name, check_fn, fix_note in REFLECTION_CHECKLIST:
-        if tier in ("CRITICAL", "HIGH") and not check_fn(plan_to_check):
-            notes.append(f"GAP [{check_name}]: {fix_note}")
+    required_tools = {
+        "CRITICAL": ["compliance_agent", "cold_storage_agent", "insurance_agent"],
+        "HIGH": ["compliance_agent"],
+        "MEDIUM": ["compliance_agent"],
+    }
+    for tool_name in required_tools.get(tier, []):
+        if tool_name in deferred:
+            continue
+        if tool_name not in executed:
+            notes.append(f"GAP [{tool_name}]: Required for {tier} but was not executed")
+        elif tool_name in failed:
+            notes.append(f"GAP [{tool_name}]: Executed but FAILED — needs retry")
 
-    if not notes:
-        notes.append("Plan passes all reflection checks. Ready for execution.")
+    # --- Quality checks: context-dependent tool recommendations ---
+    transit_phase = ri.get("transit_phase", "")
+    delay_class = ri.get("delay_class", "")
+    spoilage = ri.get("ml_spoilage_probability", 0) or 0
 
-    logger.info("REFLECT  %d notes", len(notes))
-    return {"reflection_notes": notes}
+    comp = result_map.get("compliance_agent", {})
+    comp_status = (comp.get("compliance_status") or comp.get("status") or "").lower()
+    disposition = (comp.get("product_disposition") or "").lower()
+
+    if comp_status in ("violation", "non_compliant") and "cold_storage_agent" not in executed and tier in ("HIGH", "CRITICAL"):
+        notes.append(f"QUALITY [cold_storage_agent]: compliance found '{comp_status}' with disposition '{disposition}' — cold storage transfer needed")
+
+    if transit_phase in ("air_handoff", "customs_clearance") and "route_agent" not in executed and tier in ("HIGH", "CRITICAL"):
+        notes.append(f"QUALITY [route_agent]: transit_phase='{transit_phase}' requires rerouting evaluation")
+
+    if delay_class in ("critical", "developing") and "scheduling_agent" not in executed:
+        notes.append(f"QUALITY [scheduling_agent]: delay_class='{delay_class}' requires downstream scheduling")
+
+    if spoilage > 0.6 and tier in ("HIGH", "CRITICAL") and "insurance_agent" not in executed:
+        notes.append(f"QUALITY [insurance_agent]: spoilage_probability={spoilage:.2f} — financial protection needed")
+
+    cs = result_map.get("cold_storage_agent", {})
+    suit_score = cs.get("suitability_score", 100)
+    suit_tier = (cs.get("suitability_tier") or "").lower()
+    if isinstance(suit_score, (int, float)):
+        normalized_score = suit_score * 100 if suit_score <= 1.5 else suit_score
+    else:
+        normalized_score = 100
+    if "cold_storage_agent" in executed and (
+        normalized_score < 50
+        or suit_tier in ("marginal", "poor", "disqualified")
+    ):
+        notes.append(f"QUALITY [cold_storage_agent]: suitability_score={suit_score} tier='{suit_tier}' — facility inadequate, retry with wider search")
+
+    notif = result_map.get("notification_agent", {})
+    if "notification_agent" in executed and tier in ("HIGH", "CRITICAL"):
+        if not notif.get("agentic_workflow", True):
+            notes.append("QUALITY [notification_agent]: fell back to non-agentic mode — stakeholder delivery incomplete")
+
+    if spoilage > 0.5 and tier == "CRITICAL" and "route_agent" not in executed:
+        notes.append(f"QUALITY [route_agent]: CRITICAL event with spoilage={spoilage:.2f} — rerouting may reduce transit time and prevent loss")
+
+    if comp_status == "violation" and disposition in ("quarantine", "destroy") and tier == "CRITICAL":
+        if "scheduling_agent" in executed:
+            sched = result_map.get("scheduling_agent", {})
+            if not sched.get("facility_recommendations"):
+                notes.append("QUALITY [scheduling_agent]: compliance mandates quarantine but no facility reschedule recommendations generated")
+
+    has_quality_issues = any("GAP" in n or "QUALITY" in n for n in notes)
+
+    if deferred:
+        notes.append(f"DEFERRED: {', '.join(deferred)} held for post-approval execution")
+
+    if not any("GAP" in n or "QUALITY" in n or "DEFERRED" in n for n in notes):
+        notes.append("OK: All required tools executed with adequate results.")
+
+    logger.info("REFLECT  %d notes, quality_issues=%s, deferred=%s",
+                len(notes), has_quality_issues, list(deferred))
+    return {"reflection_notes": notes, "needs_revision": True}
 
 
 # ── 4. Revise ────────────────────────────────────────────────────────
 
 def revise(state: OrchestratorState) -> dict:
-    """Patch the plan to fix gaps identified during reflection."""
+    """Propose CORRECTIVE steps: tools that are missing, failed, quality-flagged, OR deferred."""
     ri = state["risk_input"]
-    revised = list(state.get("draft_plan", []))
+    tool_results = state.get("tool_results", [])
     notes = state.get("reflection_notes", [])
-
-    existing_tools = {s["tool"] for s in revised}
-
-    note_blob = " ".join(notes).lower()
-
-    needs_compliance = (
-        "compliance_agent" not in existing_tools
-        and ("compliance" in note_blob and "gap" in note_blob)
-    )
-    needs_notification = (
-        "notification_agent" not in existing_tools
-        and ("notification" in note_blob and "gap" in note_blob)
-    )
-    needs_approval = (
-        "approval_workflow" not in existing_tools
-        and ("approval" in note_blob and "gap" in note_blob)
-    )
-    needs_insurance = (
-        "insurance_agent" not in existing_tools
-        and ("insurance" in note_blob and "gap" in note_blob)
-    )
     tier = ri.get("risk_tier", "LOW")
-    needs_cold_storage = (
-        "cold_storage_agent" not in existing_tools
-        and tier == "CRITICAL"
-        and ("cold" in note_blob or "storage" in note_blob or "facility" in note_blob)
-        and "gap" in note_blob
-    )
-    needs_scheduling = (
-        "scheduling_agent" not in existing_tools
-        and tier in ("CRITICAL", "HIGH")
-        and ("schedul" in note_blob or "reschedul" in note_blob)
-        and "gap" in note_blob
-    )
-    needs_route = (
-        "route_agent" not in existing_tools
-        and tier in ("CRITICAL", "HIGH")
-        and ri.get("transit_phase") in ("air_handoff", "customs_clearance")
-    )
+    deferred = set(state.get("deferred_tools", []))
 
-    if needs_compliance:
-        revised.insert(0, PlanStep(
-            step=0, action="Log compliance event (added by reflection)",
-            tool="compliance_agent",
-            tool_input=_build_tool_input("compliance_agent", ri, state),
-            reason="Reflection gap: compliance logging was missing",
+    succeeded = {r["tool"] for r in tool_results if r.get("success")}
+    failed = {r["tool"] for r in tool_results if not r.get("success")}
+    note_blob = " ".join(notes).upper()
+
+    corrective_tools = [
+        "compliance_agent", "insurance_agent",
+        "cold_storage_agent", "scheduling_agent", "route_agent",
+    ]
+
+    corrective: List[PlanStep] = []
+
+    for tool_name in corrective_tools:
+        short_key = tool_name.upper()
+        has_gap = f"GAP [{short_key}]" in note_blob or f"GAP [{tool_name}]" in note_blob
+        has_quality = f"QUALITY [{short_key}]" in note_blob or f"QUALITY [{tool_name}]" in note_blob
+        is_failed = tool_name in failed
+
+        if has_quality and tool_name in succeeded:
+            reason = "Quality issue: reflection flagged output as inadequate"
+        elif tool_name in succeeded and not has_quality:
+            continue
+        elif has_gap or has_quality or is_failed:
+            reason = f"{'Retry: failed' if is_failed else 'Quality: context-needed' if has_quality else 'Gap: missing'} in first execution"
+        else:
+            continue
+
+        corrective.append(PlanStep(
+            step=len(corrective) + 1,
+            action=f"Corrective: run {tool_name} (identified by post-execution reflection)",
+            tool=tool_name,
+            tool_input=_build_tool_input(tool_name, ri, state),
+            reason=reason,
         ))
-        existing_tools.add("compliance_agent")
-    if needs_notification:
-        revised.append(PlanStep(
-            step=0, action="Send stakeholder notification (added by reflection)",
+
+    if "notification_agent" in deferred:
+        corrective.append(PlanStep(
+            step=len(corrective) + 1,
+            action="Send stakeholder notification (deferred to post-approval)",
             tool="notification_agent",
             tool_input=_build_tool_input("notification_agent", ri, state),
-            reason="Reflection gap: notification was missing",
+            reason="Notification deferred: stakeholders must not be alerted before human validates the response",
         ))
-        existing_tools.add("notification_agent")
-    if needs_insurance:
-        revised.append(PlanStep(
-            step=0, action="Prepare insurance claim documentation (added by reflection)",
-            tool="insurance_agent",
-            tool_input=_build_tool_input("insurance_agent", ri, state),
-            reason="Reflection gap: insurance claim preparation was missing",
-        ))
-        existing_tools.add("insurance_agent")
-    if needs_cold_storage:
-        revised.append(PlanStep(
-            step=0, action="Identify backup cold-storage facility (added by reflection)",
-            tool="cold_storage_agent",
-            tool_input=_build_tool_input("cold_storage_agent", ri, state),
-            reason="Reflection gap: cold storage needed for CRITICAL temperature event",
-        ))
-        existing_tools.add("cold_storage_agent")
-    if needs_scheduling:
-        revised.append(PlanStep(
-            step=0, action="Generate reschedule recommendations (added by reflection)",
-            tool="scheduling_agent",
-            tool_input=_build_tool_input("scheduling_agent", ri, state),
-            reason="Reflection gap: downstream scheduling needed for delay impact",
-        ))
-        existing_tools.add("scheduling_agent")
-    if needs_route:
-        revised.append(PlanStep(
-            step=0, action="Evaluate alternative routing options (added by safety net)",
-            tool="route_agent",
-            tool_input=_build_tool_input("route_agent", ri, state),
-            reason="Shipment is in a reroute-sensitive phase; route evaluation is required",
-        ))
-        existing_tools.add("route_agent")
-    if needs_approval:
-        revised.append(PlanStep(
-            step=0, action="Request human approval (added by reflection)",
-            tool="approval_workflow",
-            tool_input=_build_tool_input("approval_workflow", ri, state),
-            reason="Reflection gap: approval was missing for HIGH/CRITICAL action",
-        ))
-        existing_tools.add("approval_workflow")
 
-    for i, step in enumerate(revised, 1):
-        step["step"] = i
-
-    logger.info("REVISE  %d steps (was %d)", len(revised), len(state.get("draft_plan", [])))
-    return {"revised_plan": revised, "plan_revised": True, "active_plan": revised}
+    logger.info("REVISE  %d steps (%d corrective + deferred)", len(corrective), len(corrective))
+    return {"revised_plan": corrective, "plan_revised": True, "active_plan": corrective}
 
 
 # ── 5a. Cascade enrichment ───────────────────────────────────────────
@@ -621,17 +639,18 @@ _DEPENDS_ON = {
 }
 
 
+DEFERRED_FIRST_PASS = {"notification_agent"}
+
+
 def execute(state: OrchestratorState) -> dict:
     """
     Run each tool in the active plan sequentially with result-awareness.
 
     Key behaviours:
     - cascade_ctx accumulates every tool result for downstream enrichment.
-    - If a tool that a downstream tool depends on FAILED, the downstream tool
-      gets a warning injected but still runs (with degraded inputs).
-    - If cold_storage_agent finds no facility, notification_agent's message
-      is adjusted to reflect that.
-    - approval_workflow is SKIPPED here (handled by approval_gate node).
+    - notification_agent is DEFERRED to post-approval (human must validate
+      the response before stakeholders are notified).
+    - approval_workflow is SKIPPED (handled by the human_review node).
     """
     active = state.get("active_plan") or state.get("draft_plan", [])
     ri = state.get("risk_input", {})
@@ -640,6 +659,7 @@ def execute(state: OrchestratorState) -> dict:
     cascade_ctx: Dict[str, Any] = {}
     failed_tools: set = set()
     approval_id: Optional[str] = None
+    deferred: List[str] = []
 
     for step in active:
         if not isinstance(step, dict):
@@ -650,6 +670,10 @@ def execute(state: OrchestratorState) -> dict:
             errors.append("Step missing 'tool' key")
             continue
         if tool_name == "approval_workflow":
+            continue
+        if tool_name in DEFERRED_FIRST_PASS:
+            deferred.append(tool_name)
+            logger.info("EXECUTE  deferring %s to post-approval", tool_name)
             continue
         base_input = step.get("tool_input", {})
 
@@ -696,13 +720,75 @@ def execute(state: OrchestratorState) -> dict:
                 result={"error": str(exc), "status": "failed"}, success=False,
             ))
 
-    logger.info("EXECUTE  %d tools run, %d errors, %d failed",
-                len(results), len(errors), len(failed_tools))
+    logger.info("EXECUTE  %d tools run, %d errors, %d failed, %d deferred",
+                len(results), len(errors), len(failed_tools), len(deferred))
     return {
         "tool_results": results,
         "execution_errors": errors,
         "cascade_context": cascade_ctx,
         "approval_id": approval_id,
+        "deferred_tools": deferred,
+    }
+
+
+# ── 5c. Re-Execute (corrective actions from revise) ──────────────────
+
+def re_execute(state: OrchestratorState) -> dict:
+    """Run the corrective steps from the revised plan.
+
+    Only executes tools that are NEW or FAILED in the first pass.
+    Appends results to the main tool_results list.
+    """
+    revised = state.get("revised_plan") or state.get("active_plan", [])
+    ri = state.get("risk_input", {})
+    first_results = state.get("tool_results", [])
+    cascade_ctx = dict(state.get("cascade_context", {}))
+
+    results: List[ToolResult] = list(first_results)
+    errors: List[str] = list(state.get("execution_errors", []))
+    revised_results: List[ToolResult] = []
+
+    if not revised:
+        logger.info("RE_EXECUTE  no corrective steps to run")
+        return {}
+
+    for step in revised:
+        if not isinstance(step, dict):
+            continue
+        tool_name = step.get("tool", "")
+        if not tool_name or tool_name == "approval_workflow":
+            continue
+        if tool_name not in TOOL_MAP:
+            errors.append(f"Corrective: tool '{tool_name}' not available")
+            continue
+
+        base_input = step.get("tool_input", {})
+        tool_input = _enrich_tool_input(tool_name, base_input, cascade_ctx, ri)
+
+        try:
+            tool = TOOL_MAP[tool_name]
+            result = tool.invoke(tool_input)
+            cascade_ctx[tool_name] = result
+            tr = ToolResult(tool=tool_name, input=tool_input, result=result, success=True)
+            results.append(tr)
+            revised_results.append(tr)
+            logger.info("RE_EXECUTE  corrective %s → success", tool_name)
+        except Exception as exc:
+            logger.error("RE_EXECUTE  corrective %s failed: %s", tool_name, exc)
+            errors.append(f"corrective {tool_name}: {exc}")
+            tr = ToolResult(
+                tool=tool_name, input=tool_input,
+                result={"error": str(exc), "status": "failed"}, success=False,
+            )
+            results.append(tr)
+            revised_results.append(tr)
+
+    logger.info("RE_EXECUTE  %d corrective tools run", len(revised_results))
+    return {
+        "tool_results": results,
+        "execution_errors": errors,
+        "cascade_context": cascade_ctx,
+        "revised_tool_results": revised_results,
     }
 
 
@@ -731,33 +817,53 @@ def build_fallback(state: OrchestratorState) -> dict:
 # ── 7. Compile output ────────────────────────────────────────────────
 
 def compile_output(state: OrchestratorState) -> dict:
-    """Assemble the final structured output matching system_prompt.md format."""
+    """Assemble the final structured output for the always-review pipeline."""
     ri = state["risk_input"]
     tier = ri.get("risk_tier", "LOW")
 
     tool_results = state.get("tool_results", [])
+    revised_results = state.get("revised_tool_results", [])
     errors = state.get("execution_errors", [])
     success_count = sum(1 for r in tool_results if r.get("success"))
     total_count = len(tool_results)
+    corrective_count = len(revised_results)
 
     awaiting = state.get("awaiting_approval", False)
+    revised_plan = state.get("revised_plan", [])
+    review_status = state.get("review_status", "")
 
     if tier == "LOW":
         summary = "Monitoring only. All metrics within acceptable range."
         confidence = 0.95
-    elif awaiting:
-        plan = state.get("active_plan") or state.get("draft_plan", [])
-        tool_names = [s.get("tool", "?") for s in plan if isinstance(s, dict)]
+    elif review_status == "corrections_proposed":
+        first_tools = [r["tool"] for r in tool_results if r.get("success")]
+        corrective_tools = [s.get("tool", "?") for s in revised_plan if isinstance(s, dict)]
         summary = (
-            f"{tier} risk detected. Agentic plan generated with {len(tool_names)} tools: "
-            f"{', '.join(tool_names)}. Awaiting human approval before execution."
+            f"{tier} risk: executed {len(first_tools)} tools ({', '.join(first_tools)}). "
+            f"Reflection identified gaps. {len(corrective_tools)} corrective actions proposed. "
+            f"Awaiting human review."
         )
-        confidence = 0.75
+        confidence = 0.70
+    elif review_status in ("adequate_pending_confirmation", "notification_pending"):
+        first_tools = [r["tool"] for r in tool_results if r.get("success")]
+        deferred = state.get("deferred_tools", [])
+        summary = (
+            f"{tier} risk: executed {len(first_tools)} tools ({', '.join(first_tools)}). "
+            f"Response adequate. {'Notification' if deferred else 'Confirmation'} pending human approval."
+        )
+        confidence = 0.80
     elif total_count == 0:
         summary = f"{tier} risk detected but no tools executed. Manual intervention required."
         confidence = 0.3
+    elif corrective_count > 0:
+        summary = (
+            f"Executed {total_count}-step response for {tier} risk "
+            f"(including {corrective_count} corrective). "
+            f"Primary issue: {state.get('primary_issue', 'N/A')}."
+        )
+        confidence = 0.85 if not errors else 0.65
     elif errors:
-        summary = f"Partial execution: {success_count}/{total_count} tools succeeded. Manual review needed."
+        summary = f"Partial execution: {success_count}/{total_count} tools succeeded."
         confidence = 0.5
     else:
         summary = (
@@ -767,8 +873,9 @@ def compile_output(state: OrchestratorState) -> dict:
         confidence = 0.85
 
     def _steps_to_dicts(steps):
-        return [{"step": s["step"], "action": s["action"], "reason": s["reason"]}
-                for s in (steps or [])]
+        return [{"step": s.get("step", i+1), "action": s.get("action", ""),
+                 "tool": s.get("tool", ""), "reason": s.get("reason", "")}
+                for i, s in enumerate(steps or []) if isinstance(s, dict)]
 
     output = {
         "shipment_id": ri.get("shipment_id"),
@@ -782,17 +889,22 @@ def compile_output(state: OrchestratorState) -> dict:
         "key_drivers": [d.get("feature", str(d)) for d in ri.get("key_drivers", [])],
         "draft_plan": _steps_to_dicts(state.get("draft_plan")),
         "reflection_notes": state.get("reflection_notes", []),
-        "revised_plan": _steps_to_dicts(state.get("revised_plan")),
+        "revised_plan": _steps_to_dicts(revised_plan),
         "actions_taken": [
             {"tool": r["tool"], "input": r["input"], "result": r["result"]}
             for r in tool_results
         ],
+        "corrective_actions": [
+            {"tool": r["tool"], "input": r["input"], "result": r["result"]}
+            for r in revised_results
+        ],
         "fallback_plan": _steps_to_dicts(state.get("fallback_plan")),
         "requires_approval": state.get("requires_approval", False),
-        "awaiting_approval": state.get("awaiting_approval", False),
+        "awaiting_approval": awaiting,
         "approval_reason": state.get("approval_reason", ""),
         "approval_id": state.get("approval_id"),
-        "proposed_tools": [s.get("tool", "") for s in (state.get("active_plan") or state.get("draft_plan", []))
+        "review_status": review_status,
+        "proposed_tools": [s.get("tool", "") for s in revised_plan
                            if isinstance(s, dict) and s.get("tool") != "approval_workflow"],
         "llm_reasoning": state.get("llm_reasoning", ""),
         "cascade_context": state.get("cascade_context", {}),
@@ -800,11 +912,13 @@ def compile_output(state: OrchestratorState) -> dict:
         "observation": state.get("observation", ""),
         "observation_issues": state.get("observation_issues", []),
         "replan_count": state.get("replan_count", 0),
-        "audit_log_summary": f"{total_count} tools executed, {len(errors)} errors, tier={tier}"
-            + (f", replanned {state.get('replan_count', 0)}x" if state.get("replan_count", 0) > 0 else ""),
+        "audit_log_summary": (
+            f"{total_count} tools executed, {len(errors)} errors, tier={tier}"
+        ),
         "confidence": confidence,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
-    logger.info("OUTPUT  tier=%s confidence=%.2f tools=%d", tier, confidence, total_count)
+    logger.info("OUTPUT  tier=%s confidence=%.2f tools=%d review=%s",
+                tier, confidence, total_count, review_status)
     return {"final_output": output, "decision_summary": summary, "confidence": confidence}

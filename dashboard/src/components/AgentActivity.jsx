@@ -234,13 +234,43 @@ function SchedulingResult({ r }) {
 function NotificationResult({ r }) {
   if (!r) return null;
   const ap = r.alert_payload || {};
+  const isAgentic = r.agentic_workflow === true;
+  const sent = r.notifications_sent || [];
+
+  const msgPreview = r.message_preview || ap.message || r.message || '';
+
   return (
-    <div className="grid grid-cols-2 gap-x-4 gap-y-0.5">
-      <KV label="Channel" value={r.channel} />
-      <KV label="Recipients" value={Array.isArray(r.recipients) ? r.recipients.join(', ') : safeStr(r.recipients)} />
-      <KV label="Revised ETA" value={ap.revised_eta} mono />
-      <KV label="Spoilage" value={ap.spoilage_probability_pct != null ? `${ap.spoilage_probability_pct}%` : null} />
-      {ap.message && <div className="col-span-2"><KV label="Message" value={ap.message} /></div>}
+    <div className="space-y-2">
+      <div className="grid grid-cols-2 gap-x-4 gap-y-0.5">
+        <KV label="Channel" value={r.channel} />
+        <KV label="Recipients" value={Array.isArray(r.recipients) ? r.recipients.join(', ') : safeStr(r.recipients)} />
+        {isAgentic && <KV label="Batch ID" value={r.notification_batch_id} mono />}
+        {isAgentic && <KV label="Sent/Failed" value={`${r.successful_deliveries || 0} / ${r.failed_deliveries || 0}`} />}
+        {!isAgentic && <KV label="Revised ETA" value={ap.revised_eta} mono />}
+        {!isAgentic && <KV label="Spoilage" value={ap.spoilage_probability_pct != null ? `${ap.spoilage_probability_pct}%` : null} />}
+      </div>
+
+      {msgPreview && (
+        <div className="mt-1.5 p-2.5 rounded-lg bg-amber-500/5 border border-amber-500/15">
+          <span className="text-[9px] font-semibold text-amber-400 uppercase tracking-wider block mb-1">Notification Message</span>
+          <p className="text-xs text-amber-200/90 leading-relaxed whitespace-pre-wrap">{msgPreview}</p>
+        </div>
+      )}
+
+      {sent.length > 0 && (
+        <div className="space-y-1">
+          <span className="text-[9px] font-semibold text-cyan-400 uppercase tracking-wider">Delivered Notifications</span>
+          {sent.slice(0, 4).map((n, i) => (
+            <div key={i} className="flex items-center gap-2 text-[11px] p-1.5 rounded bg-slate-800/40">
+              <span className={`w-1.5 h-1.5 rounded-full ${n.status === 'sent' ? 'bg-emerald-400' : 'bg-red-400'}`} />
+              <span className="text-slate-300 font-medium">{n.recipient_name || n.recipient_role}</span>
+              <span className="text-slate-500">via {n.channel}</span>
+              {n.subject && <span className="text-cyan-300/80 truncate ml-auto max-w-[200px]">"{n.subject}"</span>}
+            </div>
+          ))}
+          {sent.length > 4 && <p className="text-[10px] text-slate-500">+{sent.length - 4} more</p>}
+        </div>
+      )}
     </div>
   );
 }
@@ -325,35 +355,49 @@ function AgentRegistry() {
 
 function PipelineSteps({ decision }) {
   const d = decision || {};
-  const replanned = (d.replan_count || 0) > 0;
   const isPostApproval = d._execution_mode === 'post_approval' || d._execution_mode === 'human_selective';
-  const isAwaitingApproval = d.awaiting_approval && !isPostApproval;
+  const isConfirmed = d._execution_mode === 'confirmed' || d.review_status === 'confirmed';
+  const isAwaitingReview = d.awaiting_approval && !isPostApproval && !isConfirmed;
+  const hasRevisedPlan = Array.isArray(d.revised_plan) && d.revised_plan.length > 0;
+  const hasCorrections = d.review_status === 'corrections_proposed';
+  const hasReflection = Array.isArray(d.reflection_notes) && d.reflection_notes.length > 0;
+  const hasObservation = !!d.observation;
+  const hasExecution = Array.isArray(d.actions_taken) && d.actions_taken.length > 0;
 
   const steps = isPostApproval ? [
     { label: 'Interpret', done: true, icon: Activity },
     { label: 'Plan', done: true, icon: Brain },
+    { label: 'Execute', done: true, icon: Play },
+    { label: 'Observe', done: true, icon: Eye },
     { label: 'Reflect', done: true, icon: Cpu },
-    { label: 'Revise', done: true, icon: Zap },
-    { label: 'Approved', done: true, icon: Shield, special: true },
-    { label: 'Execute', done: Array.isArray(d.actions_taken) && d.actions_taken.length > 0, icon: Play },
-    { label: 'Observe', done: !!d.observation, icon: Eye },
+    ...(hasRevisedPlan ? [{ label: 'Revise', done: true, icon: Zap }] : []),
+    { label: 'Reviewed', done: true, icon: Shield, special: true },
+    { label: 'Re-Execute', done: true, icon: RotateCcw },
     { label: 'Output', done: !!d.decision_summary, icon: CheckCircle },
-  ] : isAwaitingApproval ? [
+  ] : isConfirmed ? [
     { label: 'Interpret', done: true, icon: Activity },
     { label: 'Plan', done: true, icon: Brain },
+    { label: 'Execute', done: true, icon: Play },
+    { label: 'Observe', done: true, icon: Eye },
     { label: 'Reflect', done: true, icon: Cpu },
-    { label: 'Revise', done: Array.isArray(d.revised_plan) && d.revised_plan.length > 0, icon: Zap },
-    { label: 'Approval Gate', done: true, icon: Shield, special: true },
-    { label: 'Execute', done: false, icon: Play },
+    { label: 'Confirmed', done: true, icon: Shield, special: true },
+    { label: 'Output', done: true, icon: CheckCircle },
+  ] : isAwaitingReview ? [
+    { label: 'Interpret', done: true, icon: Activity },
+    { label: 'Plan', done: true, icon: Brain },
+    { label: 'Execute', done: hasExecution, icon: Play },
+    { label: 'Observe', done: hasObservation, icon: Eye },
+    { label: 'Reflect', done: hasReflection, icon: Cpu },
+    ...(hasRevisedPlan ? [{ label: 'Revise', done: true, icon: Zap }] : []),
+    { label: 'Human Review', done: false, icon: Shield, special: true, pulse: true },
     { label: 'Output', done: false, icon: CheckCircle },
   ] : [
     { label: 'Interpret', done: true, icon: Activity },
     { label: 'Plan', done: Array.isArray(d.draft_plan) && d.draft_plan.length > 0, icon: Brain },
-    { label: 'Reflect', done: Array.isArray(d.reflection_notes) && d.reflection_notes.length > 0, icon: Cpu },
-    { label: 'Revise', done: Array.isArray(d.revised_plan) && d.revised_plan.length > 0, icon: Zap },
-    { label: 'Execute', done: Array.isArray(d.actions_taken) && d.actions_taken.length > 0, icon: Play },
-    { label: 'Observe', done: !!d.observation, icon: Eye },
-    ...(replanned ? [{ label: `Re-plan ×${d.replan_count}`, done: true, icon: RotateCcw }] : []),
+    { label: 'Execute', done: hasExecution, icon: Play },
+    { label: 'Observe', done: hasObservation, icon: Eye },
+    { label: 'Reflect', done: hasReflection, icon: Cpu },
+    ...(hasRevisedPlan ? [{ label: 'Revise', done: true, icon: Zap }] : []),
     { label: 'Output', done: !!d.decision_summary, icon: CheckCircle },
   ];
   return (
@@ -365,6 +409,7 @@ function PipelineSteps({ decision }) {
           <div key={s.label} className="flex items-center gap-1 shrink-0">
             <div className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[10px] font-semibold ${
               isReplan ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20'
+                : s.special && s.pulse ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20 animate-pulse'
                 : s.special ? 'bg-violet-500/10 text-violet-400 border border-violet-500/20'
                 : s.done ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/20'
                 : 'bg-white/[0.03] text-slate-600 border border-white/[0.06]'
@@ -619,14 +664,27 @@ function ObservationPanel({ decision }) {
 
 function renderActions(actionsTaken, decisionMeta) {
   if (!Array.isArray(actionsTaken) || actionsTaken.length === 0) return null;
-  return (
-    <div className="grid grid-cols-2 gap-3">
-      {actionsTaken.map((a, j) => {
+
+  const firstPass = actionsTaken.filter(a => a?._pass === 'first_pass');
+  const postApproval = actionsTaken.filter(a => a?._pass === 'post_approval');
+  const ungrouped = actionsTaken.filter(a => !a?._pass);
+  const hasBothPasses = firstPass.length > 0 && postApproval.length > 0;
+
+  const renderGroup = (items, label, labelColor) => (
+    <>
+      {label && (
+        <div className="col-span-2 flex items-center gap-2 pt-1">
+          <div className="h-px flex-1 bg-white/[0.06]" />
+          <span className={`text-[10px] font-bold uppercase tracking-wider ${labelColor}`}>{label}</span>
+          <div className="h-px flex-1 bg-white/[0.06]" />
+        </div>
+      )}
+      {items.map((a, j) => {
         if (!a || typeof a !== 'object') return null;
         const meta = getAgentMeta(a.tool);
         const Icon = meta.icon;
         return (
-          <div key={j} className={`rounded-xl p-4 border ${meta.color.border} ${meta.color.bg}`}>
+          <div key={`${label}-${j}`} className={`rounded-xl p-4 border ${meta.color.border} ${meta.color.bg}`}>
             <div className="flex items-center gap-2 mb-2">
               <Icon className={`w-4 h-4 ${meta.color.text}`} />
               <span className={`text-xs font-bold ${meta.color.text}`}>{meta.name}</span>
@@ -636,6 +694,19 @@ function renderActions(actionsTaken, decisionMeta) {
           </div>
         );
       })}
+    </>
+  );
+
+  return (
+    <div className="grid grid-cols-2 gap-3">
+      {hasBothPasses ? (
+        <>
+          {renderGroup(firstPass, `First Pass — ${firstPass.length} tools`, 'text-slate-500')}
+          {renderGroup(postApproval, `Post-Approval — ${postApproval.length} tools`, 'text-violet-400')}
+        </>
+      ) : (
+        renderGroup(ungrouped.length > 0 ? ungrouped : actionsTaken, null, null)
+      )}
     </div>
   );
 }
@@ -646,7 +717,9 @@ function DecisionCard({ decision, expanded, onToggle }) {
   const d = decision || {};
   const actionsCount = Array.isArray(d.actions_taken) ? d.actions_taken.length : 0;
   const isPostApproval = d._execution_mode === 'post_approval';
-  const isAwaitingApproval = d.awaiting_approval && !isPostApproval;
+  const isConfirmed = d._execution_mode === 'confirmed' || d.review_status === 'confirmed';
+  const isAwaitingApproval = d.awaiting_approval && !isPostApproval && !isConfirmed;
+  const hasCorrections = d.review_status === 'corrections_proposed';
 
   return (
     <div className={`glass-card overflow-hidden ${
@@ -664,18 +737,23 @@ function DecisionCard({ decision, expanded, onToggle }) {
           {actionsCount > 0 && <span className="flex items-center gap-1 text-xs text-emerald-400"><CheckCircle className="w-3.5 h-3.5" />{actionsCount} tools</span>}
 
           {isPostApproval && (
-            <span className="flex items-center gap-1 px-2 py-0.5 rounded-lg text-[10px] font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-              <CheckCircle className="w-3 h-3" /> Approved & Executed
+            <span className="flex items-center gap-1 px-2 py-0.5 rounded-lg text-[10px] font-bold bg-violet-500/10 text-violet-400 border border-violet-500/20">
+              <CheckCircle className="w-3 h-3" /> Reviewed & Re-Executed
             </span>
           )}
-          {isAwaitingApproval && (
+          {isConfirmed && (
+            <span className="flex items-center gap-1 px-2 py-0.5 rounded-lg text-[10px] font-bold bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
+              <CheckCircle className="w-3 h-3" /> Human Confirmed
+            </span>
+          )}
+          {isAwaitingApproval && hasCorrections && (
             <span className="flex items-center gap-1 px-2 py-0.5 rounded-lg text-[10px] font-bold bg-amber-500/10 text-amber-400 border border-amber-500/20">
-              <Shield className="w-3 h-3" /> Plan Ready — Awaiting Approval
+              <Shield className="w-3 h-3" /> Corrections Proposed — Awaiting Review
             </span>
           )}
-          {!isPostApproval && !isAwaitingApproval && actionsCount === 0 && d.risk_tier !== 'LOW' && (
-            <span className="flex items-center gap-1 px-2 py-0.5 rounded-lg text-[10px] font-bold bg-slate-500/10 text-slate-400 border border-slate-500/20">
-              Auto-Executed
+          {isAwaitingApproval && !hasCorrections && (
+            <span className="flex items-center gap-1 px-2 py-0.5 rounded-lg text-[10px] font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+              <Shield className="w-3 h-3" /> Execution Complete — Awaiting Confirmation
             </span>
           )}
 
@@ -696,22 +774,32 @@ function DecisionCard({ decision, expanded, onToggle }) {
               </span>
             </div>
           )}
-          {isAwaitingApproval && (
+          {isAwaitingApproval && hasCorrections && (
             <div className="bg-amber-500/5 border border-amber-500/10 rounded-lg px-3 py-2 space-y-2">
               <div className="flex items-center gap-2 text-[11px]">
                 <Shield className="w-3.5 h-3.5 text-amber-400" />
                 <span className="text-amber-400 font-medium">
-                  Plan generated by LLM — no tools have executed yet. Go to Approvals tab to review and execute.
+                  Tools executed. Post-execution reflection found gaps — corrective actions proposed. Go to Review Queue to approve, modify, or dismiss.
                 </span>
               </div>
               {Array.isArray(d.proposed_tools) && d.proposed_tools.length > 0 && (
                 <div className="flex flex-wrap gap-1.5">
-                  <span className="text-[10px] text-slate-500 mr-1">Proposed:</span>
+                  <span className="text-[10px] text-slate-500 mr-1">Proposed corrections:</span>
                   {d.proposed_tools.map(t => (
                     <span key={t} className="bg-amber-500/10 text-amber-400 text-[10px] px-2 py-0.5 rounded border border-amber-500/15">{t}</span>
                   ))}
                 </div>
               )}
+            </div>
+          )}
+          {isAwaitingApproval && !hasCorrections && (
+            <div className="bg-emerald-500/5 border border-emerald-500/10 rounded-lg px-3 py-2">
+              <div className="flex items-center gap-2 text-[11px]">
+                <Shield className="w-3.5 h-3.5 text-emerald-400" />
+                <span className="text-emerald-400 font-medium">
+                  All tools executed successfully. Reflection found no gaps. Go to Review Queue to confirm or add additional tools.
+                </span>
+              </div>
             </div>
           )}
 
@@ -730,16 +818,37 @@ function DecisionCard({ decision, expanded, onToggle }) {
             <div>
               <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-2">Reflection</p>
               {d.reflection_notes.map((n, j) => (
-                <p key={j} className={`text-xs ${String(n).includes('GAP') ? 'text-amber-400/80' : 'text-emerald-400/70'}`}>{safeStr(n)}</p>
+                <p key={j} className={`text-xs ${
+                  String(n).includes('GAP') ? 'text-amber-400/80'
+                  : String(n).includes('QUALITY') ? 'text-cyan-400/80'
+                  : 'text-emerald-400/70'
+                }`}>{safeStr(n)}</p>
               ))}
             </div>
           )}
-          {Array.isArray(d.revised_plan) && d.revised_plan.length > 0 && <PlanSection title="Revised Plan" steps={d.revised_plan} />}
+          {Array.isArray(d.revised_plan) && d.revised_plan.length > 0 && (
+            <PlanSection
+              title="Revised Plan (from reflection)"
+              steps={d.revised_plan}
+              postApprovalTools={isPostApproval ? (d.post_approval_actions || []).map(a => a?.tool).filter(Boolean) : null}
+            />
+          )}
 
           {actionsCount > 0 && (
             <div>
-              <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-3">Tool Execution Results</p>
+              <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-3">
+                {isPostApproval ? 'All Tool Execution Results' : Array.isArray(d.corrective_actions) && d.corrective_actions.length > 0 ? 'First-Pass Execution Results' : 'Tool Execution Results'}
+              </p>
               {renderActions(d.actions_taken, d)}
+            </div>
+          )}
+
+          {Array.isArray(d.corrective_actions) && d.corrective_actions.length > 0 && (
+            <div>
+              <p className="text-[10px] font-semibold text-amber-400/80 uppercase tracking-wider mb-3 flex items-center gap-1">
+                <RotateCcw className="w-3 h-3" /> Corrective Execution Results
+              </p>
+              {renderActions(d.corrective_actions, d)}
             </div>
           )}
 
@@ -750,25 +859,47 @@ function DecisionCard({ decision, expanded, onToggle }) {
   );
 }
 
-function PlanSection({ title, steps }) {
+function PlanSection({ title, steps, postApprovalTools }) {
   if (!Array.isArray(steps)) return null;
+  const isDeferred = (s) => {
+    const act = String(s?.action || '').toLowerCase();
+    const tool = String(s?.tool || '').toLowerCase();
+    return act.includes('deferred') || (tool === 'notification_agent' && act.includes('notification'));
+  };
   return (
     <div>
       <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-2">{title}</p>
       <div className="space-y-1.5">
         {steps.map((s, i) => {
           if (!s || typeof s !== 'object') return null;
+          const deferred = isDeferred(s);
           return (
-            <div key={i} className="flex gap-3 text-xs items-start">
-              <span className="font-mono text-slate-600 w-5 text-right shrink-0 pt-0.5">{s.step ?? i + 1}.</span>
+            <div key={i} className={`flex gap-3 text-xs items-start ${deferred ? 'pl-2 border-l-2 border-violet-500/30' : ''}`}>
+              <span className={`font-mono w-5 text-right shrink-0 pt-0.5 ${deferred ? 'text-violet-500' : 'text-slate-600'}`}>{s.step ?? i + 1}.</span>
               <div className="min-w-0">
-                <span className="text-slate-300">{safeStr(s.action)}</span>
-                {s.tool && <span className="ml-2 text-cyan-500/70 font-mono text-[10px]">[{s.tool}]</span>}
-                {s.reason && <p className="text-[10px] text-slate-600 mt-0.5 truncate">{safeStr(s.reason)}</p>}
+                <span className={deferred ? 'text-violet-300' : 'text-slate-300'}>{safeStr(s.action)}</span>
+                {s.tool && <span className={`ml-2 font-mono text-[10px] ${deferred ? 'text-violet-400/70' : 'text-cyan-500/70'}`}>[{s.tool}]</span>}
+                {deferred && <span className="ml-2 text-[9px] bg-violet-500/10 text-violet-400 px-1.5 py-0.5 rounded border border-violet-500/20">⏳ awaits approval</span>}
+                {s.reason && <p className={`text-[10px] mt-0.5 truncate ${deferred ? 'text-violet-500/60' : 'text-slate-600'}`}>{safeStr(s.reason)}</p>}
               </div>
             </div>
           );
         })}
+        {Array.isArray(postApprovalTools) && postApprovalTools.length > 0 && (
+          <div className="mt-2 pt-2 border-t border-violet-500/15 space-y-1.5">
+            <p className="text-[9px] font-semibold text-violet-400 uppercase tracking-wider flex items-center gap-1"><CheckCircle className="w-2.5 h-2.5" /> Executed after human approval</p>
+            {postApprovalTools.map((t, i) => (
+              <div key={i} className="flex gap-3 text-xs items-start pl-2 border-l-2 border-emerald-500/30">
+                <span className="font-mono text-emerald-500 w-5 text-right shrink-0 pt-0.5">✓</span>
+                <div className="min-w-0">
+                  <span className="text-emerald-300">Executed {safeStr(t)}</span>
+                  <span className="ml-2 text-emerald-400/70 font-mono text-[10px]">[{t}]</span>
+                  <span className="ml-2 text-[9px] bg-emerald-500/10 text-emerald-400 px-1.5 py-0.5 rounded border border-emerald-500/20">✓ approved</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );

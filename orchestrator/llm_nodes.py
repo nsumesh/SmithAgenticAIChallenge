@@ -225,67 +225,133 @@ Construct real tool_input values using the risk event data. Use actual shipment_
         return det_plan(state)
 
 
-# ── Agentic Reflect ──────────────────────────────────────────────────
+# ── Agentic Reflect (POST-EXECUTION: analyzes real results) ──────────
 
 REFLECT_SYSTEM = """You are a GDP/FDA compliance auditor for pharmaceutical cold-chain logistics.
-You review action plans against regulatory requirements. Be specific and cite the regulation.
+You have received the EXECUTION RESULTS of an automated response to a risk event.
+Your job: analyze what the tools actually did, check result quality, and identify genuine gaps.
 
-KEY COMPLIANCE CHECKS:
-- GDP Ch 9: Every risk event MUST have an immutable audit record BEFORE any intervention.
-- FDA 21 CFR 211.150: Distribution records must include all actions taken during excursions.
-- WHO PQS: Stakeholders (healthcare facilities, patients) must be notified of any delivery impact.
-- GDP Ch 5: Irreversible actions (rerouting, disposal) require documented human approval.
-- Insurance: CRITICAL excursions with product at risk require claim preparation for financial recovery.
+You evaluate TWO things:
+1. MANDATORY TOOL PRESENCE: Were the required tools executed and did they succeed?
+2. RESULT QUALITY & CONTEXT: Are the results adequate? Does the situation require additional tools?
 
-If a check fails, prefix with "GAP [check_name]:" exactly. Be specific about WHAT is missing.
+QUALITY CHECKS (these can trigger corrections even if mandatory tools passed):
+- compliance_agent returned "violation" + "quarantine" but cold_storage_agent was not called → cold storage transfer needed
+- cold_storage_agent returned suitability_score < 50 or suitability_tier="marginal"/"poor" → facility inadequate, retry
+- spoilage_probability > 0.5 and CRITICAL tier but route_agent not called → rerouting may reduce transit time
+- transit_phase is "air_handoff"/"customs_clearance" and route_agent was not called → rerouting evaluation needed
+- delay_class is "critical" or "developing" and scheduling_agent was not called → downstream scheduling needed
+- spoilage_probability > 0.6 and HIGH/CRITICAL tier but insurance_agent not called → financial protection needed
+- notification_agent has agentic_workflow=false for HIGH/CRITICAL → stakeholder delivery incomplete
+- compliance mandates "quarantine"/"destroy" but scheduling didn't reschedule any deliveries → gap
+
+PREFIX RULES:
+- "GAP [tool_name]:" for mandatory tools that are MISSING or FAILED
+- "QUALITY [tool_name]:" for context/quality issues that need a NEW or RETRY tool
+- "OK:" for checks that passed
+
+If ALL mandatory tools succeeded AND no quality issues found, set has_gaps=false.
 Return ONLY valid JSON."""
 
 
 def reflect_llm(state: OrchestratorState) -> dict:
-    """LLM agent critiques the plan and identifies compliance gaps."""
+    """Post-execution reflection: LLM analyzes REAL tool outputs and identifies gaps.
+
+    notification_agent is always deferred to post-approval so it is excluded
+    from gap analysis here.  needs_revision is always True because the deferred
+    notification must be proposed in the revise step.
+    """
     ri = state["risk_input"]
     tier = ri.get("risk_tier", "LOW")
 
     if tier == "LOW":
-        return {"reflection_notes": ["LOW risk: monitoring only, no action needed."]}
+        return {"reflection_notes": ["LOW risk: monitoring only."], "needs_revision": False}
+
+    tool_results = state.get("tool_results", [])
+    deferred = set(state.get("deferred_tools", []))
+
+    if not tool_results:
+        notes = [f"GAP [execution]: No tools were executed for {tier} risk event."]
+        if deferred:
+            notes.append(f"DEFERRED: {', '.join(deferred)} held for post-approval")
+        return {"reflection_notes": notes, "needs_revision": True}
 
     llm = get_llm()
     if llm is None:
         from orchestrator.nodes import reflect as det_reflect
         return det_reflect(state)
 
-    draft = state.get("draft_plan", [])
-    tools_in_plan = [s.get("tool", "unknown") for s in draft if isinstance(s, dict)]
-    plan_summary = "\n".join(
-        f"  {s.get('step', i)}. [{s.get('tool', '?')}] {s.get('action', '?')}"
-        for i, s in enumerate(draft, 1) if isinstance(s, dict)
-    )
+    executed_tools = [r["tool"] for r in tool_results]
+    succeeded = [r["tool"] for r in tool_results if r.get("success")]
+    failed = [r["tool"] for r in tool_results if not r.get("success")]
 
-    user_msg = f"""Review this {tier} risk action plan for compliance gaps.
+    results_text = ""
+    for r in tool_results:
+        status = "SUCCESS" if r.get("success") else "FAILED"
+        result_data = r.get("result", {})
+        summary_parts = []
+        if isinstance(result_data, dict):
+            for k, v in list(result_data.items())[:6]:
+                summary_parts.append(f"{k}={repr(v)[:80]}")
+        results_text += f"\n  [{status}] {r['tool']}: {', '.join(summary_parts)}"
 
-CONTEXT:
+    required_for_tier = {
+        "CRITICAL": ["compliance_agent", "cold_storage_agent", "insurance_agent"],
+        "HIGH": ["compliance_agent"],
+        "MEDIUM": ["compliance_agent"],
+    }
+    required = required_for_tier.get(tier, [])
+    missing = [t for t in required if t not in executed_tools and t not in deferred]
+
+    transit_phase = ri.get("transit_phase", "")
+    delay_class = ri.get("delay_class", "")
+    spoilage = ri.get("ml_spoilage_probability", 0)
+
+    user_msg = f"""Analyze these EXECUTION RESULTS for a {tier} risk event.
+
+NOTE: notification_agent is DEFERRED to post-approval — do NOT flag it as missing.
+
+SHIPMENT CONTEXT:
+  shipment_id: {ri.get('shipment_id')}
   risk_tier: {tier}
-  fused_risk_score: {ri.get('fused_risk_score')}
-  ml_spoilage_probability: {ri.get('ml_spoilage_probability')}
-  rules_fired: {ri.get('deterministic_rule_flags', [])}
+  product: {ri.get('product_type')}
+  transit_phase: {transit_phase}
+  delay_class: {delay_class}
+  spoilage_probability: {spoilage}
+  hours_to_breach: {ri.get('hours_to_breach', 'N/A')}
   primary_issue: {state.get('primary_issue', '')}
+  fused_risk_score: {ri.get('fused_risk_score', 0)}
 
-PLAN ({len(draft)} steps):
-{plan_summary}
+MANDATORY TOOLS FOR {tier} (excluding deferred): {required}
+  Flag as "GAP [tool]:" if missing or failed.
 
-Tools in plan: {tools_in_plan}
+CONTEXT-DEPENDENT TOOLS (flag as QUALITY if situation warrants):
+  - cold_storage_agent: needed if compliance found "violation"/"quarantine" and tier >= HIGH
+  - route_agent: needed if transit_phase is "air_handoff"/"customs_clearance", OR CRITICAL with spoilage > 0.5
+  - scheduling_agent: needed if delay_class is "critical" or "developing"
+  - insurance_agent: needed if spoilage_probability > 0.6 and tier >= HIGH
 
-MANDATORY CHECKS for {tier}:
-1. compliance_agent present? {"YES" if "compliance_agent" in tools_in_plan else "NO - MISSING"}
-2. notification_agent present? {"YES" if "notification_agent" in tools_in_plan else "NO - MISSING"}
-3. approval_workflow present? {"YES" if "approval_workflow" in tools_in_plan else "NO - MISSING"}
-{"4. cold_storage_agent present? " + ("YES" if "cold_storage_agent" in tools_in_plan else "NO - MISSING") if tier == "CRITICAL" else ""}
-{"5. insurance_agent present? " + ("YES" if "insurance_agent" in tools_in_plan else "NO - MISSING") if tier == "CRITICAL" else ""}
+TOOLS EXECUTED: {executed_tools}
+SUCCEEDED: {succeeded}
+FAILED: {failed}
+MISSING FROM MANDATORY: {missing}
+DEFERRED TO POST-APPROVAL: {list(deferred)}
+
+EXECUTION RESULTS:{results_text}
+
+Evaluate:
+1. Are any MANDATORY tools missing or failed? → "GAP [tool_name]:"
+2. Do the results QUALITY warrant additional tools? → "QUALITY [tool_name]:"
+   - compliance_status = "violation"/"quarantine" but cold_storage not called → QUALITY
+   - cold_storage suitability_score < 50 → QUALITY (retry)
+   - CRITICAL with spoilage > 0.5 but no route_agent → QUALITY
+3. If everything is adequate, note "OK: all checks passed"
 
 Respond with ONLY this JSON:
 {{
-  "notes": ["observation or GAP [name]: description"],
-  "has_gaps": true/false
+  "notes": ["GAP/QUALITY/OK [context]: description"],
+  "has_gaps": true/false,
+  "overall_assessment": "adequate or inadequate"
 }}"""
 
     try:
@@ -303,8 +369,46 @@ Respond with ONLY this JSON:
         if not isinstance(notes, list):
             notes = [str(notes)]
 
-        logger.info("AGENT_REFLECT: %d notes, has_gaps=%s", len(notes), parsed.get("has_gaps"))
-        return {"reflection_notes": notes}
+        strip_tools = {"triage_agent"}
+        medium_optional = {"route_agent", "scheduling_agent"}
+        cleaned_notes = []
+        for n in notes:
+            n_str = str(n)
+            n_upper = n_str.upper()
+            if "NOTIFICATION" in n_upper and ("GAP" in n_upper or "MISSING" in n_upper):
+                logger.debug("AGENT_REFLECT: stripping notification GAP (deferred by design)")
+                continue
+            if "TRIAGE" in n_upper and "GAP" in n_upper:
+                continue
+            if "GAP" in n_upper and tier == "MEDIUM":
+                gap_tool = None
+                for ot in medium_optional:
+                    if ot in n_str.lower():
+                        gap_tool = ot
+                        break
+                if gap_tool and gap_tool not in set(failed):
+                    continue
+            cleaned_notes.append(n)
+
+        has_quality_issues = any(
+            "GAP" in str(n).upper() or "QUALITY" in str(n).upper()
+            for n in cleaned_notes
+        )
+
+        if deferred:
+            cleaned_notes.append(f"DEFERRED: {', '.join(deferred)} held for post-approval execution")
+
+        if not cleaned_notes:
+            cleaned_notes.append(
+                f"All mandatory tools for {tier} executed successfully. Response adequate."
+            )
+
+        logger.info("AGENT_REFLECT: %d notes (cleaned from %d), quality_issues=%s, deferred=%s",
+                     len(cleaned_notes), len(notes), has_quality_issues, list(deferred))
+        return {
+            "reflection_notes": cleaned_notes,
+            "needs_revision": True,
+        }
 
     except Exception as exc:
         logger.error("AGENT_REFLECT failed (%s), falling back", exc)
@@ -312,59 +416,83 @@ Respond with ONLY this JSON:
         return det_reflect(state)
 
 
-# ── Agentic Revise ───────────────────────────────────────────────────
+# ── Agentic Revise (proposes CORRECTIVE actions based on real results) ─
 
-REVISE_SYSTEM = """You are a pharmaceutical cold-chain action plan editor.
-You receive a draft plan and reflection notes (which may contain GAP warnings).
-Your job: produce a CORRECTED plan that addresses every gap.
+REVISE_SYSTEM = """You are a pharmaceutical cold-chain corrective action planner.
+You receive EXECUTION RESULTS and REFLECTION NOTES that identify gaps and quality issues.
+Your job: propose corrective steps to fix GAP and QUALITY issues.
 
 RULES:
-- Keep all existing valid steps. Do NOT remove steps that are already correct.
-- Add missing tools identified in GAP notes. Place compliance_agent FIRST, approval_workflow LAST.
-- IMPORTANT: Each tool should appear EXACTLY ONCE in the plan. Do NOT duplicate any tool.
-- Construct real tool_input using the shipment data provided. No placeholders.
+- For "GAP [tool]:" notes → propose that tool (it was missing or failed).
+- For "QUALITY [tool]:" notes → propose that tool (it was not called but the situation needs it).
+- Do NOT re-run tools that already SUCCEEDED unless reflection explicitly flags a quality problem with their output.
+- Do NOT propose triage_agent (it's a ranking tool, not corrective).
+- Each tool appears AT MOST ONCE.
+- Construct real tool_input using the shipment data.
 - Return ONLY valid JSON."""
 
 
 def revise_llm(state: OrchestratorState) -> dict:
-    """LLM rewrites the plan to fix gaps identified during reflection."""
+    """Generate corrective plan: GAP/QUALITY tools + always-deferred notification."""
     llm = get_llm()
     if llm is None:
         from orchestrator.nodes import revise as det_revise
         return det_revise(state)
 
     ri = state["risk_input"]
-    draft = state.get("draft_plan", [])
+    tool_results = state.get("tool_results", [])
     notes = state.get("reflection_notes", [])
+    deferred = set(state.get("deferred_tools", []))
 
-    plan_text = "\n".join(
-        f"  {s.get('step', i)}. [{s.get('tool', '?')}] {s.get('action', '?')}"
-        for i, s in enumerate(draft, 1) if isinstance(s, dict)
-    )
+    succeeded = [r["tool"] for r in tool_results if r.get("success")]
+    failed = [r["tool"] for r in tool_results if not r.get("success")]
+
+    results_text = ""
+    for r in tool_results:
+        status = "SUCCESS" if r.get("success") else "FAILED"
+        results_text += f"\n  [{status}] {r['tool']}"
+
     notes_text = "\n".join(f"  - {n}" for n in notes)
 
-    user_msg = f"""Fix this action plan based on the reflection gaps.
+    tier = ri.get("risk_tier", "LOW")
+    required_for_tier = {
+        "CRITICAL": ["compliance_agent", "cold_storage_agent", "insurance_agent"],
+        "HIGH": ["compliance_agent"],
+        "MEDIUM": ["compliance_agent"],
+    }
+    mandatory = required_for_tier.get(tier, [])
+
+    user_msg = f"""Generate CORRECTIVE steps to fix gaps and quality issues.
+Do NOT include notification_agent — it is handled separately.
 
 SHIPMENT CONTEXT:
   shipment_id: {ri.get('shipment_id')}
   container_id: {ri.get('container_id')}
   window_id: {ri.get('window_id')}
-  risk_tier: {ri.get('risk_tier')}
+  risk_tier: {tier}
   product_type: {ri.get('product_type')}
   transit_phase: {ri.get('transit_phase')}
+  delay_class: {ri.get('delay_class', '')}
   ml_spoilage_probability: {ri.get('ml_spoilage_probability')}
 
-CURRENT PLAN:
-{plan_text}
+FIRST EXECUTION RESULTS:{results_text}
 
-REFLECTION NOTES (fix ALL gaps):
+ALREADY SUCCEEDED (do NOT re-run unless quality flagged): {succeeded}
+FAILED (retry): {failed}
+
+REFLECTION NOTES:
 {notes_text}
 
-AVAILABLE TOOLS:
-{TOOLS_REFERENCE}
+RULES:
+- For each "GAP [tool]:" → propose that missing/failed tool
+- For each "QUALITY [tool]:" → propose that tool (it's needed by context)
+- Do NOT propose triage_agent or notification_agent
+- Do NOT re-run already-succeeded tools unless reflection calls out quality issue
+- If no GAP or QUALITY issues found, return empty steps
 
-Return ONLY this JSON:
+Return ONLY corrective steps as JSON:
 {{
+  "corrective_reasoning": "1-2 sentences on what needs fixing",
   "steps": [
     {{"step": 1, "action": "...", "tool": "tool_name", "tool_input": {{...}}, "reason": "..."}}
   ]
@@ -382,14 +510,31 @@ Return ONLY this JSON:
             from orchestrator.nodes import revise as det_revise
             return det_revise(state)
 
+        notes_blob = " ".join(state.get("reflection_notes", [])).upper()
+        quality_tools = set()
+        for tool_key in TOOL_MAP:
+            if f"QUALITY [{tool_key.upper()}]" in notes_blob or f"QUALITY [{tool_key}]" in notes_blob:
+                quality_tools.add(tool_key)
+
         revised: List[PlanStep] = []
         seen_tools: set = set()
+        succeeded_set = set(succeeded)
+        mandatory_set = set(mandatory)
+        allowed_set = mandatory_set | quality_tools | set(failed)
+
         for s in parsed["steps"]:
             tool_name = s.get("tool", "")
             if tool_name not in TOOL_MAP:
                 continue
             if tool_name in seen_tools:
-                logger.debug("AGENT_REVISE: skipping duplicate %s", tool_name)
+                continue
+            if tool_name in ("triage_agent", "notification_agent"):
+                continue
+            if tool_name in succeeded_set and tool_name not in quality_tools:
+                logger.debug("AGENT_REVISE: skipping already-succeeded %s", tool_name)
+                continue
+            if tool_name not in allowed_set:
+                logger.debug("AGENT_REVISE: skipping %s (not in allowed set)", tool_name)
                 continue
             seen_tools.add(tool_name)
             llm_input = s.get("tool_input", {})
@@ -404,13 +549,27 @@ Return ONLY this JSON:
                 reason=s.get("reason", ""),
             ))
 
-        if not revised:
-            logger.warning("AGENT_REVISE: 0 valid steps, falling back")
-            from orchestrator.nodes import revise as det_revise
-            return det_revise(state)
+        if "notification_agent" in deferred:
+            from orchestrator.nodes import _build_tool_input
+            revised.append(PlanStep(
+                step=len(revised) + 1,
+                action="Send stakeholder notification (deferred to post-approval)",
+                tool="notification_agent",
+                tool_input=_build_tool_input("notification_agent", ri, state),
+                reason="Notification deferred: stakeholders must not be alerted before human validates the response",
+            ))
 
-        logger.info("AGENT_REVISE: %d steps (was %d)", len(revised), len(draft))
-        return {"revised_plan": revised, "plan_revised": True, "active_plan": revised}
+        corrective_reasoning = parsed.get("corrective_reasoning", "")
+        existing_reasoning = state.get("llm_reasoning", "")
+        combined_reasoning = f"{existing_reasoning} | Correction: {corrective_reasoning}" if corrective_reasoning else existing_reasoning
+
+        logger.info("AGENT_REVISE: %d steps (%d corrective + deferred)", len(revised), len(revised))
+        return {
+            "revised_plan": revised,
+            "plan_revised": True,
+            "active_plan": revised,
+            "llm_reasoning": combined_reasoning,
+        }
 
     except Exception as exc:
         logger.error("AGENT_REVISE failed (%s), falling back", exc)

@@ -4,14 +4,20 @@ FastAPI backend for AI Cargo Monitoring.
 Serves the risk-scored data to the React dashboard and provides
 tool-execution endpoints that the orchestrator will call.
 
+Includes an embedded Supabase Realtime stream listener that
+automatically detects new window_features rows, scores them, and
+triggers orchestration — no separate process or hardcoded URLs needed.
+
 Run:  uvicorn backend.app:app --reload --port 8000
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -42,7 +48,156 @@ BASE = Path(__file__).resolve().parent.parent
 SCORED_CSV = BASE / "artifacts" / "scored_windows.csv"
 AUDIT_DIR = BASE / "audit_logs"
 
-app = FastAPI(title="AI Cargo Monitor", version="1.0.0")
+
+# ── Embedded Supabase stream listener ─────────────────────────────
+
+_TIERS_TO_ORCHESTRATE = {"MEDIUM", "HIGH", "CRITICAL"}
+_stream_stats = {"ingested": 0, "orchestrated": 0, "errors": 0}
+
+
+async def _process_stream_record(record: dict):
+    """Score a streamed row and trigger orchestration if risky."""
+    from src.feature_engineering import engineer_features
+    from src.deterministic_engine import score_row
+    from src.risk_fusion import fuse_scores
+
+    window_id = record.get("window_id", "?")
+    try:
+        profiles = _get_profiles()
+        row_df = pd.DataFrame([record])
+        for col in ("window_start", "window_end"):
+            if col in row_df.columns:
+                row_df[col] = pd.to_datetime(row_df[col], errors="coerce")
+        row_df = engineer_features(row_df, profiles)
+        row = row_df.iloc[0]
+
+        det_score, det_results = score_row(row, profiles)
+        rules_fired = [r.rule_name for r in det_results if r.fired]
+        ml_score = float(record.get("ml_score", det_score * 0.8))
+        final_score, risk_tier, actions, requires_human = fuse_scores(det_score, ml_score)
+
+        scored = {
+            "window_id": window_id,
+            "shipment_id": record.get("shipment_id"),
+            "risk_score": round(final_score, 4),
+            "risk_tier": risk_tier,
+            "rules_fired": rules_fired,
+        }
+        await _broadcast({"type": "ingest_scored", "result": scored})
+        _stream_stats["ingested"] += 1
+
+        logger.info("STREAM_SCORED  %s tier=%s score=%.4f", window_id, risk_tier, final_score)
+
+        if risk_tier in _TIERS_TO_ORCHESTRATE:
+            try:
+                risk_data = score_window(window_id)
+            except HTTPException:
+                risk_data = _build_risk_input_from_record(record, final_score, risk_tier, rules_fired, ml_score)
+
+            decision = run_orchestrator(risk_data)
+            decision["_window_id"] = window_id
+            _orchestrator_history.append(decision)
+            if len(_orchestrator_history) > _MAX_HISTORY:
+                _orchestrator_history[:] = _orchestrator_history[-_MAX_HISTORY:]
+            await _broadcast({"type": "orchestrator_decision", "decision": decision})
+            _stream_stats["orchestrated"] += 1
+            logger.info("STREAM_ORCH   %s tier=%s actions=%d",
+                        window_id, risk_tier, len(decision.get("actions_taken", [])))
+
+    except Exception as e:
+        _stream_stats["errors"] += 1
+        logger.warning("Stream processing failed for %s: %s", window_id, e)
+
+
+def _build_risk_input_from_record(record, final_score, risk_tier, rules_fired, ml_score):
+    """Build a minimal risk_input when the window isn't in the scored CSV."""
+    return {
+        "window_id": record.get("window_id"),
+        "shipment_id": record.get("shipment_id"),
+        "container_id": record.get("container_id"),
+        "product_id": record.get("product_id"),
+        "leg_id": record.get("leg_id", ""),
+        "product_type": record.get("product_id", ""),
+        "transit_phase": record.get("transit_phase", ""),
+        "risk_tier": risk_tier,
+        "fused_risk_score": final_score,
+        "ml_spoilage_probability": ml_score * 0.7,
+        "deterministic_rule_flags": rules_fired,
+        "avg_temp_c": record.get("avg_temp_c"),
+        "temp_slope_c_per_hr": record.get("temp_slope_c_per_hr"),
+        "current_delay_min": record.get("current_delay_min", 0),
+        "delay_class": "developing" if record.get("current_delay_min", 0) > 30 else "stable",
+        "key_drivers": [],
+        "facility": {},
+        "product_cost": {},
+    }
+
+
+async def _stream_listener_loop():
+    """Background task: subscribe to Supabase Realtime and process INSERTs."""
+    url = os.environ.get("SUPABASE_URL", "")
+    key = os.environ.get("SUPABASE_KEY", "")
+    if not url or not key:
+        logger.info("Stream listener disabled — no Supabase credentials")
+        return
+
+    try:
+        from supabase._async.client import AsyncClient, create_client as acreate
+    except ImportError:
+        logger.warning("Stream listener disabled — supabase async client not installed")
+        return
+
+    await asyncio.sleep(2)
+
+    try:
+        sb: AsyncClient = await acreate(url, key)
+
+        def _on_insert(payload: dict):
+            record = (
+                payload.get("data", {}).get("record")
+                or payload.get("record")
+                or {}
+            )
+            if not record.get("window_id"):
+                return
+            logger.info("STREAM  new row: %s | shipment=%s",
+                        record.get("window_id"), record.get("shipment_id"))
+            asyncio.get_running_loop().create_task(_process_stream_record(record))
+
+        channel = sb.channel("window-stream")
+        channel.on_postgres_changes(
+            event="INSERT",
+            schema="public",
+            table="window_features",
+            callback=_on_insert,
+        )
+        await channel.subscribe()
+        logger.info("Stream listener active — subscribed to window_features INSERT")
+
+        while True:
+            await asyncio.sleep(60)
+            logger.info("STREAM_STATS  ingested=%d orchestrated=%d errors=%d",
+                        _stream_stats["ingested"], _stream_stats["orchestrated"],
+                        _stream_stats["errors"])
+
+    except asyncio.CancelledError:
+        logger.info("Stream listener shutting down")
+    except Exception as e:
+        logger.error("Stream listener error: %s", e)
+
+
+@asynccontextmanager
+async def lifespan(app_instance):
+    task = asyncio.create_task(_stream_listener_loop())
+    yield
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+app = FastAPI(title="AI Cargo Monitor", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -293,25 +448,78 @@ async def decide_approval(approval_id: str, body: ApprovalDecision):
     return result
 
 
+@app.post("/api/approvals/{approval_id}/confirm")
+async def confirm_approved(approval_id: str, body: Dict[str, Any] = None):
+    """Confirm that first-pass execution was sufficient — no re-execution.
+
+    The human reviewed the results and decided corrections are not needed.
+    Closes the review without running any additional tools.
+    """
+    from tools.approval_workflow import _PENDING_APPROVALS
+    record = _PENDING_APPROVALS.get(approval_id)
+    if not record:
+        raise HTTPException(404, f"Approval {approval_id} not found")
+    if record.get("status") not in ("pending", "approved"):
+        raise HTTPException(400, f"Approval {approval_id} cannot be confirmed (status={record.get('status')})")
+
+    body = body or {}
+    record["status"] = "confirmed"
+    record["decided_at"] = datetime.now(timezone.utc).isoformat()
+    record["decided_by"] = body.get("decided_by", "operator")
+    record["decision"] = "confirmed"
+    record["executed_tools"] = []
+
+    window_id = record.get("window_id") or record.get("shipment_id", "")
+
+    for i, old in enumerate(_orchestrator_history):
+        old_wid = old.get("_window_id") or old.get("window_id", "")
+        old_aid = old.get("approval_id")
+        if old_aid == approval_id or (old_wid == window_id and old.get("awaiting_approval")):
+            old["awaiting_approval"] = False
+            old["_execution_mode"] = "confirmed"
+            old["_approved_by"] = record["decided_by"]
+            old["_approved_at"] = record["decided_at"]
+            old["review_status"] = "confirmed"
+            old["decision_summary"] = old.get("decision_summary", "").replace(
+                "Awaiting human review.", "Human confirmed — first-pass response adequate."
+            ).replace(
+                "Awaiting human confirmation.", "Human confirmed — response adequate."
+            )
+            _orchestrator_history[i] = old
+            break
+
+    await _broadcast({"type": "approval_confirmed", "approval_id": approval_id, "record": record})
+    return record
+
+
 @app.post("/api/approvals/{approval_id}/execute")
 async def execute_approved(approval_id: str, body: Dict[str, Any] = None):
-    """Execute approved actions — REPLACES the original history entry.
+    """Execute corrective/additional tools after human review.
 
-    Always uses selective execution to avoid re-creating approval_workflow.
-    If user selected specific tools, runs only those. Otherwise runs all
-    proposed tools from the original approval minus approval_workflow.
+    The human selects which tools to run. Replaces the original history entry
+    with the post-approval execution result, preserving the planning data.
     """
     from tools.approval_workflow import _PENDING_APPROVALS
     from orchestrator.graph import run_orchestrator_selective
     record = _PENDING_APPROVALS.get(approval_id)
     if not record:
         raise HTTPException(404, f"Approval {approval_id} not found")
-    if record.get("status") != "approved":
+    if record.get("status") not in ("pending", "approved"):
         raise HTTPException(400, f"Approval {approval_id} is not approved (status={record.get('status')})")
 
     window_id = record.get("window_id") or record.get("shipment_id", "")
     body = body or {}
-    selected_tools = body.get("selected_tools")
+    selected_tools = body.get("selected_tools", [])
+    selected_tools = [t for t in selected_tools if t != "approval_workflow"]
+
+    if not selected_tools:
+        proposed = record.get("proposed_corrections", [])
+        deferred = record.get("proposed_deferred", [])
+        combined = [t for t in (proposed + deferred) if t != "approval_workflow"]
+        if combined:
+            selected_tools = combined
+        else:
+            return await confirm_approved(approval_id, body)
 
     try:
         risk_data = score_window(window_id)
@@ -323,15 +531,6 @@ async def execute_approved(approval_id: str, body: Dict[str, Any] = None):
             "risk_tier": record.get("risk_tier", "HIGH"),
         }
 
-    if not selected_tools:
-        proposed = record.get("proposed_actions", [])
-        selected_tools = [t for t in proposed if t != "approval_workflow" and ":" not in t]
-        if not selected_tools:
-            default_tools = ["compliance_agent", "cold_storage_agent", "notification_agent",
-                             "insurance_agent", "scheduling_agent"]
-            selected_tools = default_tools
-
-    selected_tools = [t for t in selected_tools if t != "approval_workflow"]
     decision = run_orchestrator_selective(risk_data, selected_tools)
 
     record["status"] = "executed"
@@ -344,18 +543,61 @@ async def execute_approved(approval_id: str, body: Dict[str, Any] = None):
     decision["_approved_by"] = record.get("decided_by", "operator")
     decision["_approved_at"] = record.get("decided_at", "")
     decision["awaiting_approval"] = False
+    decision["review_status"] = "executed"
+
+    first_pass_actions = record.get("first_pass_actions", [])
+    post_approval_actions = decision.get("actions_taken", [])
+    for a in post_approval_actions:
+        if isinstance(a, dict):
+            a["_pass"] = "post_approval"
+    decision["actions_taken"] = first_pass_actions + post_approval_actions
+    decision["first_pass_actions"] = first_pass_actions
+    decision["post_approval_actions"] = post_approval_actions
+
+    saved_cascade = record.get("cascade_context", {})
+    if saved_cascade:
+        merged_cascade = dict(saved_cascade)
+        merged_cascade.update(decision.get("cascade_context", {}))
+        decision["cascade_context"] = merged_cascade
+        decision["cascade_summary"] = {
+            k: str(v)[:200] for k, v in merged_cascade.items()
+        }
+
+    PLAN_KEYS = ("draft_plan", "reflection_notes", "revised_plan",
+                  "llm_reasoning", "proposed_tools", "observation",
+                  "observation_issues", "observation_actions")
+    orig = record.get("original_plan", {})
+    if orig:
+        for key in PLAN_KEYS:
+            if orig.get(key):
+                decision[key] = orig[key]
 
     replaced = False
     for i, old in enumerate(_orchestrator_history):
-        old_wid = old.get("_window_id") or old.get("window_id", "")
         old_aid = old.get("approval_id")
+        old_wid = old.get("_window_id") or old.get("window_id", "")
         if old_aid == approval_id or (old_wid == window_id and old.get("awaiting_approval")):
-            for key in ("draft_plan", "reflection_notes", "revised_plan", "llm_reasoning", "proposed_tools"):
-                if key in old and old[key]:
-                    decision[key] = old[key]
+            if not orig:
+                for key in PLAN_KEYS:
+                    if key in old and old[key]:
+                        decision[key] = old[key]
             _orchestrator_history[i] = decision
             replaced = True
             break
+
+    fp_tools = [a["tool"] for a in first_pass_actions if isinstance(a, dict)]
+    pa_tools = [a["tool"] for a in post_approval_actions if isinstance(a, dict)]
+    tier = decision.get("risk_tier", record.get("risk_tier", ""))
+    decision["decision_summary"] = (
+        f"{tier} risk: {len(fp_tools)} tools executed in first pass "
+        f"({', '.join(fp_tools)}). Human approved — "
+        f"{len(pa_tools)} post-approval tool(s) executed "
+        f"({', '.join(pa_tools)})."
+    )
+    decision["confidence"] = max(
+        orig.get("confidence", 0) if orig else decision.get("confidence", 0),
+        0.85
+    )
 
     if not replaced:
         _orchestrator_history.append(decision)

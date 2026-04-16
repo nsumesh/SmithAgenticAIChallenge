@@ -43,26 +43,25 @@ const SYSTEM_MERMAID = `graph TB
     ml -->|"ml_score<br/>+ SHAP"| fusion
   end
 
-  subgraph Orchestration["🧠 LAYER 3 — Agentic Orchestration (LangGraph)"]
+  subgraph Orchestration["🧠 LAYER 3 — Act-First Agentic Orchestration (LangGraph)"]
     direction LR
     interpret["🔍 Interpret Risk<br/>tier + context assembly<br/>delay class · hours to breach"]
     plan["📝 Plan (Groq LLM)<br/>llama-3.3-70b-versatile<br/>tool selection + input construction"]
-    reflect["🪞 Reflect (LLM)<br/>self-critique draft plan<br/>identify gaps & missing tools"]
-    revise["🔄 Revise (LLM)<br/>LLM rewrites plan<br/>fills all gaps from reflection"]
-    gate["🚦 Approval Gate<br/>HIGH/CRITICAL → pause for human<br/>MEDIUM → auto-execute"]
     execute["▶ Execute Tools<br/>result-aware cascade<br/>dependency tracking"]
-    observe["👁 Observe (LLM)<br/>inspect execution results<br/>decide if re-plan needed"]
+    observe["👁 Observe (LLM)<br/>analyze execution results<br/>quality assessment"]
+    reflect["🪞 Reflect (LLM)<br/>post-execution analysis<br/>identify gaps in REAL results"]
+    revise["🔄 Revise (LLM)<br/>propose corrective steps<br/>fix failures & missing tools"]
+    hreview["👤 Human Review<br/>ALWAYS for MEDIUM+<br/>confirm · augment · override"]
     output["📊 Compile Output<br/>decision summary<br/>confidence + audit trail"]
     interpret -->|"risk_input<br/>+ context"| plan
-    plan -->|"draft_plan<br/>steps + inputs"| reflect
-    reflect -->|"GAP found"| revise
-    reflect -->|"plan OK"| gate
-    revise -->|"revised<br/>plan"| gate
-    gate -->|"MEDIUM<br/>auto-execute"| execute
-    gate -->|"HIGH/CRITICAL<br/>plan-only"| output
+    plan -->|"LOW → skip"| output
+    plan -->|"MEDIUM+"| execute
     execute -->|"tool results"| observe
-    observe -->|"adequate"| output
-    observe -->|"issues found<br/>(CRITICAL only)"| plan
+    observe -->|"execution<br/>summary"| reflect
+    reflect -->|"adequate"| hreview
+    reflect -->|"GAP found"| revise
+    revise -->|"corrective<br/>plan"| hreview
+    hreview -->|"confirm or<br/>execute corrections"| output
   end
 
   subgraph AgentTools["🛠 LAYER 4 — Agent Tools (8 Autonomous)"]
@@ -110,7 +109,7 @@ const SYSTEM_MERMAID = `graph TB
   class fe,det,ml,fusion risk
   class interpret,execute,output orch
   class plan,reflect,revise,observe llm
-  class gate human
+  class hreview human
   class t_comply,t_route,t_cold,t_notify,t_sched,t_insure,t_triage,t_approve tools
   class dash,approve_q,selective,ws human`;
 

@@ -245,3 +245,54 @@ def load_facilities_with_fallback() -> Dict[str, dict]:
     path = _BASE / "data" / "facilities.json"
     with open(path) as f:
         return json.load(f)
+
+
+# ── Shipments ─────────────────────────────────────────────────────
+
+_shipments_cache: Dict[str, dict] = {}
+
+
+def fetch_shipment_by_id(shipment_id: str) -> Optional[dict]:
+    """Fetch a single shipment row by shipment_id (cached after first hit)."""
+    if shipment_id in _shipments_cache:
+        return _shipments_cache[shipment_id]
+
+    client = _get_client()
+    if client is None:
+        return None
+    try:
+        resp = (
+            client.table("shipments")
+            .select("*")
+            .eq("shipment_id", shipment_id)
+            .limit(1)
+            .execute()
+        )
+        if resp.data:
+            _shipments_cache[shipment_id] = resp.data[0]
+            return resp.data[0]
+        return None
+    except Exception as e:
+        logger.warning("shipments fetch failed for %s: %s", shipment_id, e)
+        return None
+
+
+def fetch_all_shipments(limit: int = 500) -> Optional[Dict[str, dict]]:
+    """Fetch all shipments → dict keyed by shipment_id."""
+    client = _get_client()
+    if client is None:
+        return None
+    try:
+        resp = client.table("shipments").select("*").limit(limit).execute()
+        if not resp.data:
+            return None
+        result = {}
+        for row in resp.data:
+            sid = row.get("shipment_id", "")
+            if sid:
+                result[sid] = row
+        logger.info("Supabase shipments: %d rows", len(result))
+        return result
+    except Exception as e:
+        logger.error("shipments fetch failed: %s", e)
+        return None

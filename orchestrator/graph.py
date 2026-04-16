@@ -1,21 +1,26 @@
 """
 Advanced orchestration agent -- LangGraph StateGraph.
 
-Graph topology (plan-first HITL):
-  interpret → plan → reflect → [revise] → approval_gate
-                                            ├── LOW/MEDIUM: execute → observe → [re-plan?] → output
-                                            └── HIGH/CRITICAL: output (plan-only, awaiting human)
+Topology (act-first, HITL always-review):
+  interpret -> plan -> [tier_route]
+    LOW  -> output  (monitoring only)
+    MEDIUM+ -> execute -> observe -> reflect -> [should_revise]
+        adequate  -> human_review -> output
+        has gaps  -> revise -> human_review -> output
 
-  After human approves: run_orchestrator_selective() does the real execution.
+Every MEDIUM+ event pauses at human_review.  The human can:
+  - Confirm (first pass was sufficient)
+  - Approve corrective tools (execute them)
+  - Modify the corrective selection
+  - Dismiss corrections and close with first-pass results
 
-The approval gate ensures tools only run ONCE — after human review for
-HIGH/CRITICAL events. LOW/MEDIUM events execute automatically.
+Re-execution only happens via the POST /api/approvals/{id}/execute
+endpoint, outside the graph.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Dict
 
 from langgraph.graph import END, StateGraph
@@ -33,8 +38,6 @@ from orchestrator.nodes import (
 from orchestrator.state import OrchestratorState
 
 logger = logging.getLogger(__name__)
-
-MAX_REPLAN = 1
 
 
 def _get_plan_node():
@@ -73,120 +76,153 @@ def _get_observe_node():
 
 
 def _observe_deterministic(state: OrchestratorState) -> dict:
-    """Deterministic post-execution check: flag if critical tools failed."""
+    """Deterministic post-execution summary."""
     tool_results = state.get("tool_results", [])
-    tier = state.get("risk_input", {}).get("risk_tier", "LOW")
     failed = [r["tool"] for r in tool_results if not r.get("success")]
-
-    if failed and tier == "CRITICAL":
-        return {
-            "observation": f"CRITICAL: {len(failed)} tools failed: {failed}",
-            "needs_replan": True,
-            "observation_issues": [f"{t} failed" for t in failed],
-            "observation_actions": [f"retry or replace {t}" for t in failed],
-        }
-    return {"observation": "adequate", "needs_replan": False}
-
-
-def _should_revise(state: OrchestratorState) -> str:
-    notes = state.get("reflection_notes", [])
-    tier = state["risk_input"].get("risk_tier", "LOW")
-
-    if tier == "LOW":
-        return "skip_to_output"
-
-    has_gaps = any("GAP" in str(n).upper() for n in notes)
-    already_revised = state.get("plan_revised", False)
-
-    if has_gaps and not already_revised:
-        return "revise"
-    return "approval_gate"
-
-
-def _approval_gate(state: OrchestratorState) -> dict:
-    """Decide whether to pause for human approval or auto-execute.
-
-    HIGH/CRITICAL → creates an approval request and STOPS (no tool execution).
-    MEDIUM → proceeds to execute automatically.
-    """
-    tier = state["risk_input"].get("risk_tier", "MEDIUM")
-    requires = tier in ("HIGH", "CRITICAL")
-
-    if requires:
-        from tools.approval_workflow import _execute as create_approval
-        ri = state["risk_input"]
-        active = state.get("active_plan") or state.get("draft_plan", [])
-        proposed = [s.get("tool", "") for s in active if isinstance(s, dict) and s.get("tool") != "approval_workflow"]
-
-        result = create_approval(
-            shipment_id=ri.get("shipment_id", ""),
-            action_description=f"{tier} risk event: {state.get('primary_issue', 'unknown')}",
-            risk_tier=tier,
-            urgency="immediate" if tier == "CRITICAL" else "urgent",
-            proposed_actions=proposed,
-            justification=state.get("llm_reasoning", "Agentic plan requires human review"),
-            requested_by="orchestrator",
-            window_id=ri.get("window_id"),
-            container_id=ri.get("container_id"),
-        )
-        logger.info("APPROVAL_GATE  tier=%s → paused, approval_id=%s, proposed=%s",
-                     tier, result.get("approval_id"), proposed)
-        return {
-            "requires_approval": True,
-            "approval_reason": f"{tier} risk requires human review before tool execution",
-            "approval_id": result.get("approval_id"),
-            "awaiting_approval": True,
-        }
-    else:
-        return {
-            "requires_approval": False,
-            "awaiting_approval": False,
-        }
-
-
-def _after_approval_gate(state: OrchestratorState) -> str:
-    """Route after the approval gate: execute or stop."""
-    if state.get("awaiting_approval"):
-        return "plan_only_output"
-    return "execute"
-
-
-def _should_replan(state: OrchestratorState) -> str:
-    """After observe: re-plan if needed and under the iteration limit."""
-    needs = state.get("needs_replan", False)
-    count = state.get("replan_count", 0)
-
-    if needs and count < MAX_REPLAN:
-        logger.info("OBSERVE→REPLAN: iteration %d, re-planning", count + 1)
-        return "replan"
-    return "finalize"
-
-
-def _replan_increment(state: OrchestratorState) -> dict:
-    """Bump the replan counter and feed observation back into planning context."""
-    count = state.get("replan_count", 0)
-    issues = state.get("observation_issues", [])
-    obs = state.get("observation", "")
-
-    existing_notes = state.get("reflection_notes", [])
-    new_notes = list(existing_notes) + [f"OBSERVATION: {obs}"] + [f"ISSUE: {i}" for i in issues]
-
     return {
-        "replan_count": count + 1,
-        "plan_revised": False,
-        "reflection_notes": new_notes,
+        "observation": f"{len(tool_results)} tools ran, {len(failed)} failed"
+                       if tool_results else "no tools executed",
     }
 
 
-def build_orchestrator() -> StateGraph:
-    """Construct the orchestration StateGraph with plan-first HITL.
+# ── Conditional routing ──────────────────────────────────────────────
 
-    Topology:
-      interpret → plan → reflect ─┬─ GAP → revise → approval_gate
-                                   ├─ OK  → approval_gate
-                                   └─ LOW → output (skip)
-      approval_gate ─┬─ HIGH/CRITICAL → output (plan-only, awaiting approval)
-                     └─ MEDIUM       → execute → observe → [replan?] → output
+def _skip_if_low(state: OrchestratorState) -> str:
+    tier = state["risk_input"].get("risk_tier", "LOW")
+    if tier == "LOW":
+        return "output"
+    return "execute"
+
+
+def _should_revise(state: OrchestratorState) -> str:
+    """After reflect: always revise (notification is always deferred)."""
+    return "revise"
+
+
+# ── Human review node ────────────────────────────────────────────────
+
+def _human_review(state: OrchestratorState) -> dict:
+    """Always-fire review gate for MEDIUM+ events.
+
+    The revised plan always contains at least notification_agent (deferred from
+    first-pass execution).  It may also contain corrective tools identified by
+    reflect+revise.
+
+    The human can:
+      - Approve all proposed actions (corrections + notification)
+      - Deselect individual tools
+      - Dismiss corrections but still approve notification
+    """
+    from tools.approval_workflow import _execute as create_approval
+    ri = state["risk_input"]
+    tier = ri.get("risk_tier", "MEDIUM")
+    deferred = set(state.get("deferred_tools", []))
+
+    tool_results = state.get("tool_results", [])
+    first_pass_tools = [r["tool"] for r in tool_results]
+    succeeded = [r["tool"] for r in tool_results if r.get("success")]
+    failed = [r["tool"] for r in tool_results if not r.get("success")]
+
+    revised_plan = state.get("revised_plan", [])
+    proposed_all = [
+        s.get("tool", "") for s in revised_plan
+        if isinstance(s, dict) and s.get("tool") != "approval_workflow"
+    ]
+    proposed_corrections = [t for t in proposed_all if t not in deferred]
+    proposed_deferred = [t for t in proposed_all if t in deferred]
+
+    has_corrections = bool(proposed_corrections)
+
+    if has_corrections:
+        description = (
+            f"{tier} risk: executed {len(first_pass_tools)} tools "
+            f"({len(succeeded)} OK, {len(failed)} failed). "
+            f"Reflection identified {len(proposed_corrections)} corrective action(s): "
+            f"{', '.join(proposed_corrections)}. "
+            f"Notification pending approval."
+        )
+        review_status = "corrections_proposed"
+    else:
+        description = (
+            f"{tier} risk: executed {len(first_pass_tools)} tools "
+            f"({len(succeeded)} OK, {len(failed)} failed). "
+            f"No corrective actions needed — notification pending approval."
+        )
+        review_status = "notification_pending"
+
+    all_available = list(TOOL_MAP.keys())
+    remaining_tools = [t for t in all_available
+                       if t not in succeeded and t != "approval_workflow"
+                       and t not in proposed_all]
+    proposed_actions = proposed_all + remaining_tools
+
+    result = create_approval(
+        shipment_id=ri.get("shipment_id", ""),
+        action_description=description,
+        risk_tier=tier,
+        urgency="immediate" if tier == "CRITICAL" else (
+            "urgent" if tier == "HIGH" else "standard"
+        ),
+        proposed_actions=proposed_actions,
+        justification=state.get("llm_reasoning", "Post-execution review required"),
+        requested_by="orchestrator",
+        window_id=ri.get("window_id"),
+        container_id=ri.get("container_id"),
+    )
+
+    first_pass_actions = [
+        {"tool": r["tool"], "input": r.get("input", {}), "result": r.get("result", {}), "_pass": "first_pass"}
+        for r in tool_results
+    ]
+
+    def _steps_to_dicts(steps):
+        return [{"step": s.get("step", i+1), "action": s.get("action", ""), "reason": s.get("reason", ""),
+                 "tool": s.get("tool", "")}
+                for i, s in enumerate(steps or []) if isinstance(s, dict)]
+
+    from tools.approval_workflow import _PENDING_APPROVALS
+    aid = result.get("approval_id")
+    if aid and aid in _PENDING_APPROVALS:
+        _PENDING_APPROVALS[aid]["review_status"] = review_status
+        _PENDING_APPROVALS[aid]["proposed_corrections"] = proposed_corrections
+        _PENDING_APPROVALS[aid]["proposed_deferred"] = proposed_deferred
+        _PENDING_APPROVALS[aid]["first_pass_tools"] = first_pass_tools
+        _PENDING_APPROVALS[aid]["first_pass_actions"] = first_pass_actions
+        _PENDING_APPROVALS[aid]["cascade_context"] = state.get("cascade_context", {})
+        _PENDING_APPROVALS[aid]["original_plan"] = {
+            "draft_plan": _steps_to_dicts(state.get("draft_plan")),
+            "reflection_notes": state.get("reflection_notes", []),
+            "revised_plan": _steps_to_dicts(state.get("revised_plan")),
+            "llm_reasoning": state.get("llm_reasoning", ""),
+            "observation": state.get("observation", ""),
+            "observation_issues": state.get("observation_issues", []),
+            "observation_actions": state.get("observation_actions", []),
+            "proposed_tools": [s.get("tool", "") for s in (state.get("revised_plan") or [])
+                               if isinstance(s, dict) and s.get("tool") != "approval_workflow"],
+            "decision_summary": state.get("decision_summary", ""),
+            "confidence": state.get("confidence", 0),
+        }
+
+    logger.info(
+        "HUMAN_REVIEW  tier=%s review_status=%s first_pass=%d corrections=%d deferred=%d id=%s",
+        tier, review_status, len(first_pass_tools), len(proposed_corrections),
+        len(proposed_deferred), result.get("approval_id"),
+    )
+    return {
+        "requires_approval": True,
+        "awaiting_approval": True,
+        "approval_reason": description,
+        "approval_id": result.get("approval_id"),
+        "review_status": review_status,
+    }
+
+
+# ── Build graph ──────────────────────────────────────────────────────
+
+def build_orchestrator() -> StateGraph:
+    """Construct the act-first, always-review orchestration graph.
+
+    Plan -> Execute -> Observe -> Reflect -> [Revise] -> Human Review -> Output
     """
     graph = StateGraph(OrchestratorState)
 
@@ -197,42 +233,34 @@ def build_orchestrator() -> StateGraph:
 
     graph.add_node("interpret", interpret_risk)
     graph.add_node("plan", plan_node)
-    graph.add_node("reflect", reflect_node)
-    graph.add_node("revise", revise_node)
-    graph.add_node("approval_gate", _approval_gate)
     graph.add_node("execute", execute)
     graph.add_node("observe", observe_node)
-    graph.add_node("replan_bridge", _replan_increment)
+    graph.add_node("reflect", reflect_node)
+    graph.add_node("revise", revise_node)
+    graph.add_node("human_review", _human_review)
     graph.add_node("fallback", build_fallback)
     graph.add_node("output", compile_output)
 
     graph.set_entry_point("interpret")
     graph.add_edge("interpret", "plan")
-    graph.add_edge("plan", "reflect")
+
+    graph.add_conditional_edges(
+        "plan",
+        _skip_if_low,
+        {"output": "output", "execute": "execute"},
+    )
+
+    graph.add_edge("execute", "observe")
+    graph.add_edge("observe", "reflect")
 
     graph.add_conditional_edges(
         "reflect",
         _should_revise,
-        {"revise": "revise", "approval_gate": "approval_gate", "skip_to_output": "output"},
+        {"revise": "revise", "human_review": "human_review"},
     )
 
-    graph.add_edge("revise", "approval_gate")
-
-    graph.add_conditional_edges(
-        "approval_gate",
-        _after_approval_gate,
-        {"execute": "execute", "plan_only_output": "output"},
-    )
-
-    graph.add_edge("execute", "observe")
-
-    graph.add_conditional_edges(
-        "observe",
-        _should_replan,
-        {"replan": "replan_bridge", "finalize": "fallback"},
-    )
-
-    graph.add_edge("replan_bridge", "plan")
+    graph.add_edge("revise", "human_review")
+    graph.add_edge("human_review", "fallback")
     graph.add_edge("fallback", "output")
     graph.add_edge("output", END)
 
@@ -264,12 +292,7 @@ def run_orchestrator_selective(
     risk_input: Dict[str, Any],
     selected_tools: list[str],
 ) -> Dict[str, Any]:
-    """Execute only the human-selected tools — bypasses plan/reflect/revise.
-
-    Directly runs: interpret → build plan → execute → observe → compile.
-    Does NOT go through the LangGraph to avoid the LLM overwriting the
-    human-selected plan.
-    """
+    """Execute only the human-selected tools -- bypasses plan/reflect/revise."""
     from orchestrator.nodes import (
         interpret_risk, execute, build_fallback, compile_output, _build_tool_input,
     )
@@ -291,8 +314,9 @@ def run_orchestrator_selective(
         "draft_plan": plan_steps,
         "active_plan": plan_steps,
         "plan_revised": True,
-        "reflection_notes": ["Human-selected tools — skipping plan/reflect/revise."],
+        "reflection_notes": ["Human-selected tools."],
         "llm_reasoning": "Plan constructed by human operator via tool selection UI.",
+        "deferred_tools": [],
     }
 
     state.update(interpret_risk(state))
@@ -320,5 +344,4 @@ def get_mode() -> Dict[str, str]:
     }
 
 
-# Re-export TOOL_MAP for the selective runner
 from tools import TOOL_MAP

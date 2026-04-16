@@ -22,9 +22,9 @@
 ┌────────────────────────────────────────────────────────────────────────────────────┐
 │                         LAYER 1: DATA PIPELINE                                     │
 │                                                                                    │
-│  src/supabase_client.py             streaming/stream_listener.py                   │
+│  src/supabase_client.py             stream listener (embedded in backend)           │
 │  ├─ fetch_window_features()         ├─ Supabase Realtime subscription              │
-│  ├─ fetch_product_profiles()        └─ forwards to POST /api/ingest                │
+│  ├─ fetch_product_profiles()        └─ scores internally + orchestrates MEDIUM+    │
 │  ├─ fetch_product_costs()                                                          │
 │  ├─ fetch_facilities()              streaming/simulate_stream.py                   │
 │  └─ (all with local JSON fallback)  └─ replays CSV → Supabase for testing          │
@@ -111,32 +111,45 @@
 │  orchestrator/graph.py  →  build_orchestrator()  →  compiled StateGraph            │
 │  orchestrator/state.py  →  OrchestratorState TypedDict (shared mutable state)      │
 │                                                                                    │
-│  ┌─────────────────────────────────────────────────────────────────────────┐       │
-│  │                         GRAPH TOPOLOGY                                  │       │
-│  │                                                                         │       │
-│  │  ┌───────────┐    ┌──────┐    ┌─────────┐    ┌────────┐    ┌────────────────┐   │       │
-│  │  │ interpret  │───→│ plan │───→│ reflect │───→│ revise │───→│ approval_gate  │   │       │
-│  │  └───────────┘    └──────┘    └────┬────┘    └───┬────┘    └───────┬────────┘   │       │
-│  │       ▲                            │             │                 │            │       │
-│  │       │                ┌───────────┘             │                 │            │       │
-│  │       │                │  (conditional)          │                 │            │       │
-│  │       │                ▼                         ▼                 ▼            │       │
-│  │       │           LOW → output         MEDIUM → execute    HIGH/CRIT → output   │       │
-│  │       │           GAP → revise          │         │        (plan-only)        │       │
-│  │       │           OK  → approval_gate ──┘         │                           │       │
-│  │       │                                     ┌───────┴───┐    ┌─────────┐        │       │
-│  │       │                                     │ execute  │───→│ observe │        │       │
-│  │       │                                     └──────────┘    └────┬────┘        │       │
-│  │       │                                     (conditional)        │             │       │
-│  │       │                                                          ▼             │       │
-│  │       │  (replan_bridge, if CRITICAL + failures)    adequate?                   │       │
-│  │       └───────────── YES ◄─────────────────────     │                           │       │
-│  │                                              ┌──────┘                           │       │
-│  │                                              ▼                                 │       │
-│  │                                   ┌──────────┐    ┌────────┐                   │       │
-│  │                                   │ fallback  │───→│ output │──→END            │       │
-│  │                                   └──────────┘    └────────┘                   │       │
-│  └─────────────────────────────────────────────────────────────────────────┘       │
+│  ┌──────────────────────────────────────────────────────────────┐       │
+│  │      GRAPH TOPOLOGY  (Act-First, Always-Review HITL)        │       │
+│  │                                                              │       │
+│  │  ┌───────────┐    ┌──────┐                                   │       │
+│  │  │ interpret  │───→│ plan │                                   │       │
+│  │  └───────────┘    └──┬───┘                                   │       │
+│  │                      │                                       │       │
+│  │            ┌─────────┴─────────┐                             │       │
+│  │          LOW                 MEDIUM+                          │       │
+│  │            │                   │                             │       │
+│  │            ▼                   ▼                             │       │
+│  │       ┌────────┐         ┌─────────┐    ┌─────────┐         │       │
+│  │       │ output  │         │ execute │───→│ observe │         │       │
+│  │       └────────┘         └─────────┘    └────┬────┘         │       │
+│  │         (END)                                │              │       │
+│  │                                              ▼              │       │
+│  │                                         ┌─────────┐         │       │
+│  │                                         │ reflect │         │       │
+│  │                                         └────┬────┘         │       │
+│  │                                  ┌───────────┴──────────┐   │       │
+│  │                              adequate              gaps      │       │
+│  │                                  │                  │        │       │
+│  │                                  │            ┌─────┴──┐    │       │
+│  │                                  │            │ revise │    │       │
+│  │                                  │            └────┬───┘    │       │
+│  │                                  ▼                ▼        │       │
+│  │                       ┌─────────────────────────────┐       │       │
+│  │                       │       human_review          │       │       │
+│  │                       │  (ALWAYS for MEDIUM+)       │       │       │
+│  │                       │  • adequate_pending_confirm  │       │       │
+│  │                       │  • corrections_proposed      │       │       │
+│  │                       └────────────┬────────────────┘       │       │
+│  │                                    │                        │       │
+│  │                           fallback → output → END           │       │
+│  │                                                              │       │
+│  │  POST-GRAPH:                                                │       │
+│  │    Confirm & Close → /api/approvals/{id}/confirm            │       │
+│  │    Execute Corrections → /api/approvals/{id}/execute        │       │
+│  └──────────────────────────────────────────────────────────────┘       │
 │                                                                                    │
 │  NODE DETAIL (see Section 5 below for full I/O)                                    │
 └────────────────────┬───────────────────────────────────────────────────────────────┘
@@ -396,74 +409,76 @@ Adds route_agent for HIGH/CRITICAL at air_handoff or customs_clearance phases.
 OUTPUT: same as agentic (draft_plan, requires_approval) but llm_reasoning is empty
 ```
 
-### 5d. reflect (agentic)
+### 5d. reflect (agentic — POST-EXECUTION)
 
 ```
 FILE: orchestrator/llm_nodes.py :: reflect_llm()
-MODE: Agentic (Groq LLM)
+MODE: Agentic (Groq LLM) — analyzes REAL tool results, not a hypothetical plan
 
-LLM reviews the draft_plan against:
-  - Compliance logging present
-  - Notification included
-  - Human approval for irreversible actions
-  - Cold storage for CRITICAL temp events
-  - Insurance for high-value-at-risk
-  - Scheduling for delay events
-  - Tool inputs have required fields
+LLM receives:
+  - tool_results: per-tool success/failure + result summaries
+  - MANDATORY tools for this tier (explicit list):
+      CRITICAL: [compliance_agent, notification_agent, cold_storage_agent, insurance_agent]
+      HIGH:     [compliance_agent, notification_agent]
+      MEDIUM:   [compliance_agent, notification_agent]
+  - OPTIONAL tools (route_agent, triage_agent, scheduling_agent):
+      Explicitly marked as optional — LLM MUST NOT flag these as gaps
+
+KEY CONSTRAINTS:
+  - ONLY mandatory tools can be flagged as GAP
+  - If all mandatory tools succeeded → has_gaps=false, assessment="adequate"
+  - route_agent and triage_agent are never flagged as missing
 
 OUTPUT (merged into state):
-  reflection_notes → List[str]
-    "OK [check_name]: ..."     (check passes)
-    "GAP [check_name]: ..."    (check fails — triggers revise)
+  reflection_notes → List[str] ("GAP [tool_name]: ..." or "observation: ...")
+  needs_revision   → bool (True only if mandatory tools missing or failed)
 ```
 
 ### 5e. reflect (deterministic fallback)
 
 ```
 FILE: orchestrator/nodes.py :: reflect()
-MODE: 5-point checklist
+MODE: Mandatory-tools-only checklist
 
-CHECKS:
-  1. compliance_covered         → plan has compliance_agent
-  2. notification_included      → plan has notification_agent
-  3. approval_for_irreversible  → plan has approval_workflow
-  4. has_fallback               → plan has >1 step
-  5. no_empty_steps             → all tool names exist in TOOL_MAP
+REQUIRED TOOLS (per tier):
+  CRITICAL: [compliance_agent, notification_agent, cold_storage_agent, insurance_agent]
+  HIGH/MEDIUM: [compliance_agent, notification_agent]
 
-OUTPUT: reflection_notes (same format as agentic)
+For each required tool: check if executed and if succeeded.
+Only flags tools in the mandatory list — route/triage/scheduling never flagged.
+
+OUTPUT: reflection_notes (same format as agentic), needs_revision (bool)
 ```
 
-### 5f. revise (agentic + deterministic fallback)
+### 5f. revise (agentic — CORRECTIVE-ONLY)
 
 ```
 FILE: orchestrator/llm_nodes.py :: revise_llm()  |  fallback: nodes.py :: revise()
-MODE: Agentic (Groq LLM)  |  Falls back to deterministic keyword matching
+MODE: Agentic (Groq LLM)  |  Falls back to deterministic
 
 AGENTIC MODE (revise_llm):
   LLM receives:
-    - draft_plan (JSON)
-    - reflection_notes (with GAP annotations)
-    - risk context (tier, product, temp, etc.)
-  LLM rewrites the full plan:
-    - Adds missing tools to fill every GAP
-    - Constructs correct tool_input payloads
-    - Deduplication: seen_tools set prevents same tool appearing twice
-    - System prompt: "Each tool should appear EXACTLY ONCE"
-  Falls back to deterministic if LLM response is unparseable
+    - tool_results (what actually ran and their outcomes)
+    - reflection_notes (GAP annotations from reflect)
+    - MANDATORY tools for this tier (explicit list)
+  LLM proposes ONLY corrective steps:
+    - Missing mandatory tools that weren't executed
+    - Failed mandatory tools that need retry
+    - NEVER proposes route_agent, triage_agent, scheduling_agent
+      unless they specifically FAILED in first execution
+  Hard filter: code rejects any LLM-proposed tool not in mandatory_set ∪ failed_set
+  Returns empty steps if all mandatory tools succeeded
 
 DETERMINISTIC FALLBACK (revise):
-  Scans reflection_notes for keywords:
-    "compliance" + "gap"  → inserts compliance_agent at position 0
-    "notification" + "gap" → appends notification_agent
-    "insurance" + "gap"   → appends insurance_agent
-    "cold"/"storage" + "gap" → appends cold_storage_agent (CRITICAL only)
-    "schedul" + "gap"     → appends scheduling_agent (CRITICAL/HIGH)
-    "approval" + "gap"    → appends approval_workflow (always last)
+  Same mandatory-only logic: scans reflection_notes for GAP keywords,
+  only inserts tools from the tier-specific mandatory list.
+  Skips already-succeeded tools.
 
 OUTPUT (merged into state):
-  revised_plan → List[PlanStep] (rewritten plan with all gaps filled)
+  revised_plan → List[PlanStep] (corrective steps only, not full rewrite)
   active_plan  → same as revised_plan
   plan_revised → True
+  needs_revision → False (if no corrections needed)
 ```
 
 ### 5g. execute (with cascade enrichment)
@@ -536,19 +551,12 @@ LLM OUTPUT FORMAT:
     "issues": ["..."],
     "actions": ["..."] }
 
-CONDITIONAL EDGE (_should_replan):
-  needs_replan=True AND replan_count < MAX_REPLAN(=1) AND tier is CRITICAL
-    → "replan" (goes to replan_bridge → plan)
-  otherwise
-    → "finalize" (goes to fallback → output)
-
-replan_bridge node:
-  Increments replan_count by 1
-  Copies observation_issues into reflection_notes for next plan iteration
+In the new Act-First pipeline, observe runs BEFORE reflect.
+Its output feeds into reflect_llm for mandatory tool gap analysis.
+No replan loop — corrections are handled via human_review node.
 
 OUTPUT (merged into state):
   observation         → str (LLM summary of execution quality)
-  needs_replan        → bool
   observation_issues  → List[str]
   observation_actions → List[str]
 ```
@@ -580,17 +588,23 @@ Assembles the final orchestrator decision JSON:
   - draft_plan, reflection_notes, revised_plan
   - actions_taken [{tool, input, result}]
   - fallback_plan
-  - requires_approval, approval_reason, approval_id
   - llm_reasoning (full LLM thought trace)
   - cascade_context (full tool results for audit)
   - cascade_summary (truncated to 200 chars per tool for display)
   - audit_log_summary, confidence (0.0-1.0), timestamp
+  - awaiting_approval (bool — True for all MEDIUM+ tiers)
+  - review_status ("corrections_proposed" | "adequate_pending_confirmation")
+
+For MEDIUM+ tiers:
+  - awaiting_approval is ALWAYS True (human must review)
+  - review_status set based on whether reflect found gaps
+  - confidence set to 0.70 (corrections pending) or 0.80 (adequate, awaiting confirm)
 
 CONFIDENCE RULES:
-  LOW tier, no tools         → 0.95
-  Non-LOW, 0 tools executed  → 0.30
-  Partial success (errors)   → 0.50
-  Full success               → 0.85
+  LOW tier, no tools                    → 0.95
+  MEDIUM+, adequate (awaiting confirm)  → 0.80
+  MEDIUM+, corrections proposed         → 0.70
+  Partial success (errors)              → 0.50
 ```
 
 ---
@@ -692,11 +706,11 @@ LOGIC: Scores all facilities by temp compatibility × distance × capacity × ur
        filters by product temp range, returns top candidate + alternatives
 ```
 
-### 6d. notification_agent
+### 6d. notification_agent (AGENTIC — LLM + Multi-Channel Delivery)
 
 ```
-FILE: tools/notification_agent.py
-DATA: None (payload-only)
+FILE: tools/notification_agent.py + tools/helper/notification/
+DATA: Groq LLM (stakeholder selection + message composition)
 
 INPUT:
   shipment_id          str       Shipment identifier
@@ -704,20 +718,32 @@ INPUT:
   risk_tier            str       "LOW" | "MEDIUM" | "HIGH" | "CRITICAL"
   recipients           list[str] ["ops_team", "management", "clinic"]
   message              str       Alert message text
-  channel              str       "dashboard" | "email" | "sms"
+  channel              str       "dashboard" | "email" | "sms" | "slack"
   revised_eta          str?      ISO timestamp
   spoilage_probability float?    0-1
   facility_name        str?      From cold_storage cascade
 
-OUTPUT:
+OUTPUT (agentic mode — Groq available + email/Slack configured):
+  tool                     str    "notification_agent"
+  status                   str    "notifications_sent"
+  notification_batch_id    str    Batch ID for tracking
+  total_notifications      int    Total sent
+  successful_deliveries    int    Delivered count
+  failed_deliveries        int    Failed count
+  notifications_sent       list   [{notification_id, recipient_role, recipient_name,
+                                    channel, subject, status, sent_at}]
+  escalation_required      bool   Whether escalation is needed
+  regulatory_notifications bool   Whether regulatory bodies were notified
+  audit_trail_entries      int    FDA 21 CFR Part 11 audit records count
+  agentic_workflow         bool   True (confirms agentic mode)
+
+OUTPUT (fallback mode — no LLM or email config):
   tool             str    "notification_agent"
   status           str    "notification_queued"
-  recipients       list   Who was notified
-  channel          str    Channel used
-  alert_payload    dict   Full payload sent
+  alert_payload    dict   Full payload with revised_eta, spoilage, facility
   message_preview  str    First 200 chars
-  delivered        bool   False (delivery not implemented yet)
-  requires_approval bool
+  delivered        bool   False
+  agentic_workflow bool   False
 ```
 
 ### 6e. scheduling_agent
@@ -827,55 +853,67 @@ OUTPUT:
   approval_id  str    "APR-XXXXXXXX" (UUID-based)
   message      str    Human-readable status
 
-POST-APPROVAL EXECUTION (backend/app.py :: execute_approved):
-  When an operator approves and clicks Execute:
-    1. Extracts proposed_actions from approval record
-    2. Filters out "approval_workflow" (prevents ghost approvals)
-    3. Runs run_orchestrator_selective() — bypasses LangGraph entirely
-       (interpret → execute → observe → compile, no LLM plan overwrite)
-    4. Replaces original history entry in-place (no duplicate rows)
-    5. Human can also select specific tools via UI toggles
+POST-REVIEW HUMAN ACTIONS (backend/app.py):
+
+  1. CONFIRM (POST /api/approvals/{id}/confirm):
+     First pass adequate, no corrections needed. Updates history entry
+     with status="confirmed", _execution_mode="confirmed".
+     No tools re-executed.
+
+  2. EXECUTE CORRECTIONS (POST /api/approvals/{id}/execute):
+     Human selects corrective tools from proposed list.
+     Runs run_orchestrator_selective() — bypasses LangGraph entirely.
+     (interpret → execute → observe → compile, no LLM plan overwrite)
+     Replaces original history entry in-place.
+     If selected_tools is empty → treated as confirm.
+
+  3. DISMISS (same endpoint, empty tools):
+     Equivalent to confirm — first pass accepted as sufficient.
 ```
 
 ---
 
-## 7. Conditional Edge Logic
+## 7. Conditional Edge Logic (Act-First, Always-Review)
 
 ```
-orchestrator/graph.py :: _should_revise(state)  +  _should_replan(state)
+orchestrator/graph.py :: _should_execute(state) + _should_revise(state)
+
+  ┌──────────────┐
+  │     plan      │
+  └──────┬───────┘
+         │
+         ├── tier == LOW ?
+         │   └── YES → "skip_to_output"  (no tools, monitoring only)
+         │
+         └── MEDIUM/HIGH/CRITICAL ?
+             └── "execute"  (act first — run tools immediately)
+
+  execute ──→ observe ──→ reflect  (always sequential)
 
   ┌──────────────┐
   │   reflect     │
   └──────┬───────┘
          │
-         ├── tier == LOW ?
-         │   └── YES → "skip_to_output"  (no action plan needed)
+         ├── needs_revision == True ?
+         │   └── YES → "revise"  (propose corrective steps for mandatory gaps)
+         │              revise ──→ "human_review"
          │
-         ├── any note contains "GAP" AND not already revised ?
-         │   └── YES → "revise"  (patch the plan, then approval_gate)
-         │
-         └── otherwise
-             └── "approval_gate"  (plan is good; tiered execute vs plan-only)
+         └── needs_revision == False ?
+             └── "human_review"  (first pass adequate, confirm)
 
-  approval_gate ──→ execute          (MEDIUM tier: auto-execute)
-  approval_gate ──→ plan_only_output (HIGH/CRITICAL: pause for human)
+  human_review ──→ fallback ──→ output ──→ END
+  (Pipeline always terminates here. Human acts POST-GRAPH.)
 
-  ┌──────────────┐
-  │   observe     │
-  └──────┬───────┘
-         │
-         ├── needs_replan AND replan_count < 1 AND tier == CRITICAL ?
-         │   └── YES → "replan"  (replan_bridge increments count, loops to plan)
-         │
-         └── otherwise
-             └── "finalize"  (fallback → output → END)
+  POST-GRAPH HUMAN ACTIONS:
+    /api/approvals/{id}/confirm  → close without re-execution
+    /api/approvals/{id}/execute  → run selected corrective tools
 ```
 
 ---
 
 ## 8. Cascade Data Flow Example (CRITICAL Tier)
 
-**Plan-first HITL:** For CRITICAL tier, steps 1–6 below run only **after** human approval. The initial orchestration pass produces the plan (and pending approval); tool execution happens in `run_orchestrator_selective()` once the operator approves.
+**Act-First HITL:** For CRITICAL tier, steps 1–6 below run **immediately** (act first). After execution, observe → reflect analyzes results. human_review node pauses for human to confirm (if adequate) or approve corrections (if gaps found). Corrective tools run only via `POST /api/approvals/{id}/execute`.
 
 ```
 Step 1: compliance_agent
@@ -916,21 +954,19 @@ Step 6: approval_workflow
 
 ```
 ┌──────────┬─────────┬──────────────────────────────┬──────────────────────────────┐
-│ Tier     │ Score   │ Tools Triggered              │ Human Approval               │
+│ Tier     │ Score   │ Mandatory Tools              │ Human Review                 │
 ├──────────┼─────────┼──────────────────────────────┼──────────────────────────────┤
-│ CRITICAL │ 0.8-1.0 │ compliance, cold_storage,    │ YES (director-level)         │
-│          │         │ notification, scheduling,     │ Immediate urgency            │
-│          │         │ insurance, approval,          │                              │
-│          │         │ [route if air_handoff]        │                              │
+│ CRITICAL │ 0.8-1.0 │ compliance, notification,    │ ALWAYS (act-first, review    │
+│          │         │ cold_storage, insurance       │ after execution). Confirm or │
+│          │         │ + optional: scheduling, route │ approve corrections.         │
 ├──────────┼─────────┼──────────────────────────────┼──────────────────────────────┤
-│ HIGH     │ 0.6-0.8 │ compliance, notification,    │ YES (qa_manager-level)       │
-│          │         │ scheduling, approval,         │ Urgent                       │
-│          │         │ [route if air_handoff]        │                              │
+│ HIGH     │ 0.6-0.8 │ compliance, notification     │ ALWAYS (same pattern)        │
+│          │         │ + optional: scheduling, route │                              │
 ├──────────┼─────────┼──────────────────────────────┼──────────────────────────────┤
-│ MEDIUM   │ 0.3-0.6 │ compliance, notification     │ NO                           │
-│          │         │                               │ Dashboard soft alert         │
+│ MEDIUM   │ 0.3-0.6 │ compliance, notification     │ ALWAYS (confirm or correct)  │
+│          │         │                               │                              │
 ├──────────┼─────────┼──────────────────────────────┼──────────────────────────────┤
-│ LOW      │ 0.0-0.3 │ (none)                       │ NO                           │
-│          │         │                               │ Standard monitoring          │
+│ LOW      │ 0.0-0.3 │ (none)                       │ NO — monitoring only         │
+│          │         │                               │ Bypasses human_review node   │
 └──────────┴─────────┴──────────────────────────────┴──────────────────────────────┘
 ```

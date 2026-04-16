@@ -6,7 +6,7 @@
 L1   Data Pipeline (Supabase)         DONE   Karthik (gen/stream) + Rahul (integration)
 L2   Risk Scoring Engine              DONE   Rahul
 L3   Agent Tools (8 tools)            DONE   Mukul (route/insurance/triage) + Nikhil (cascade)
-                                              + Yash (RAG compliance) + Rahul (framework)
+                                              + Yash (RAG compliance + agentic notification) + Rahul (framework)
 L4   Orchestration Agent (Agentic)    DONE   Rahul (Groq LLM + deterministic fallback)
 L5   Multi-Provider LLM System        DONE   Rahul (Groq/Ollama/OpenAI/Anthropic)
 L6   Context Assembler                DONE   Nikhil (cascade context builder)
@@ -48,11 +48,15 @@ SUPABASE CLOUD
   context_assembler.py         → delay_ratio, delay_class, hours_to_breach
            │
            ▼
-  orchestrator/graph.py        → LangGraph StateGraph
-  interpret → plan(LLM) → reflect(LLM) → [revise(LLM)] → approval_gate
-                                              ├── MEDIUM: execute → observe → output (auto)
-                                              └── HIGH/CRITICAL: output (plan-only, awaiting human)
-  After approval: run_orchestrator_selective → execute → observe → output
+  orchestrator/graph.py        → LangGraph StateGraph (Act-First, Always-Review HITL)
+  interpret → plan(LLM)
+    ├── LOW → output  (monitoring only)
+    └── MEDIUM+ → execute → observe(LLM) → reflect(LLM)
+                      ├── adequate → human_review → output
+                      └── gaps → revise(LLM) → human_review → output
+  After human review:
+    ├── Confirm & Close  → no re-execution (first pass sufficient)
+    └── Execute Corrections → run_orchestrator_selective → output
            │
            │  execute() calls tools sequentially with cascade enrichment
            ▼
@@ -70,8 +74,9 @@ SUPABASE CLOUD
 
 **Data sources**: All tools and the data loader try Supabase first, fall back to local JSON/CSV.
 
-**Real-time path**: `stream_listener.py` subscribes to Supabase Realtime on `window_features` table,
-forwards new rows to `POST /api/ingest` which runs single-window scoring + orchestration.
+**Real-time path**: Stream listener is embedded in the FastAPI backend via `lifespan` startup.
+It subscribes to Supabase Realtime on `window_features`, scores new rows internally
+(no HTTP self-calls), and triggers orchestration for MEDIUM+ tiers automatically.
 
 ---
 
@@ -87,7 +92,7 @@ The orchestrator invokes them via `tool.invoke(input_dict)`.
 | 1 | **compliance_agent** | `tools/compliance_agent.py` | **RAG-powered** regulatory validation: semantic search over FDA/WHO/ICH/GDP regulations via Supabase pgvector + Groq LLM interpretation. Returns compliance status, violations, disposition, approval level, citations. Immutable audit log. Falls back to mock regs + deterministic if LLM/vector unavailable. | Supabase `compliance_knowledge` (pgvector) + mock fallback | **Yash** (RAG core) + **Rahul** (integration, async fix, cascade enrichment) |
 | 2 | **route_agent** | `tools/route_agent.py` | **Hybrid route recommendation**: looks up product temp class (frozen/refrigerated/CRT), builds safe carrier candidates from `_ROUTE_TABLE`, lets the active LLM choose among them when available, then falls back to deterministic urgency sorting | Supabase `product_profiles` + local fallback | **Mukul** + **Rahul** |
 | 3 | **cold_storage_agent** | `tools/cold_storage_agent.py` | Finds backup cold-storage: scores all facilities by temp compatibility × distance × capacity × urgency, returns top candidate + alternatives | Supabase `facilities` + `product_profiles` + local fallback | **Nikhil** (facility data) + **Rahul** (Supabase) |
-| 4 | **notification_agent** | `tools/notification_agent.py` | Multi-channel alerts: builds alert payload with revised ETA, spoilage probability, facility name (from cascade). Payload-only, no external delivery yet | (none -- payload construction only) | **Nikhil** (cascade enrichment) |
+| 4 | **notification_agent** | `tools/notification_agent.py` | **Agentic multi-channel notification**: LLM-driven stakeholder selection and message composition (Groq), multi-channel delivery (Gmail SMTP, Slack, dashboard, webhook), FDA 21 CFR Part 11 audit trails. Falls back to structured payload if agentic subsystem unavailable | Groq LLM + Gmail SMTP / Slack | **Yash** (agentic subsystem) + **Rahul** (integration) |
 | 5 | **scheduling_agent** | `tools/scheduling_agent.py` | Facility reschedule: generates per-facility recommendations with routing decisions, priority scoring, financial impact estimates, compliance flags | Supabase `facilities` + `product_costs` + local fallback | **Nikhil** (rich routing) |
 | 6 | **insurance_agent** | `tools/insurance_agent.py` | Claim preparation: itemized loss breakdown (product + disposal + handling + downstream disruption), leg excursion history from scored_windows.csv | `scored_windows.csv` + Supabase `product_costs` + `facilities` | **Mukul** (appointment_count fix) |
 | 7 | **triage_agent** | `tools/triage_agent.py` | Multi-shipment ranking: enriches with hours_at_risk, peak_temp, breach_rule from scored_windows.csv, returns priority-ordered list | `scored_windows.csv` + Supabase `product_profiles` | **Mukul** (enrichment) |
@@ -100,7 +105,7 @@ The orchestrator invokes them via `tool.invoke(input_dict)`.
 | **compliance_agent** | `risk_tier, details{product_category, current_temp_c, minutes_outside_range, spoilage_probability}` | `compliance_status, product_disposition, approval_level, violations[], log_id, decision_method` |
 | **route_agent** | `product_id, reason, current_leg_id` | `recommended_route, carrier, eta_change_hours, temp_class, selection_method, selection_rationale` |
 | **cold_storage_agent** | `product_id, urgency, location_hint, hours_to_breach` | `recommended_facility, suitability_score, advance_notice_required_hours, temp_range_supported` |
-| **notification_agent** | `risk_tier, recipients[], message, channel` | `status:"notification_queued", alert_payload, delivered:false` |
+| **notification_agent** | `risk_tier, recipients[], message, channel, revised_eta, spoilage_probability, facility_name` | Agentic: `notification_batch_id, successful_deliveries, failed_deliveries, notifications_sent[]`. Fallback: `status:"notification_queued", alert_payload, message_preview` |
 | **scheduling_agent** | `product_id, affected_facilities[], original_eta, delay_class, hours_to_breach` | `routing_decision, priority_score, financial_impact_estimate_usd, facility_recommendations[]` |
 | **insurance_agent** | `product_id, risk_tier, spoilage_probability, estimated_loss_usd` | `claim_id, loss_breakdown{product, disposal, handling, disruption}, next_steps[]` |
 | **triage_agent** | `shipments[{shipment_id, risk_tier, fused_risk_score}]` | `priority_list[], recommended_orchestration_order[], critical_count` |
@@ -110,24 +115,30 @@ The orchestrator invokes them via `tool.invoke(input_dict)`.
 
 ```
 AGENTIC MODE (Groq LLM available):
-  orchestrator/llm_nodes.py :: plan_llm()
-      │ LLM (Groq llama-3.3-70b-versatile) analyzes risk event
-      │ LLM selects tools AND constructs input payloads with domain reasoning
-      │ Falls back to deterministic templates if LLM output is malformed
-      ▼
-  orchestrator/llm_nodes.py :: reflect_llm()
-      │ LLM critiques plan: checks for compliance, notification, approval gaps
-      │ Outputs "GAP [name]: ..." notes that trigger revise
-      ▼
-EXECUTION (shared by both modes):
-  orchestrator/nodes.py :: execute()
-      │ for each step in active_plan:
-      │   base_input = step["tool_input"]           ← from LLM or template
-      │   enriched = _enrich_tool_input(...)         ← cascade enrichment
-      │   result = TOOL_MAP[tool_name].invoke(enriched)
-      │   cascade_ctx[tool_name] = result            ← feeds downstream tools
-      ▼
-CASCADE ENRICHMENT:
+  1. PLAN:    orchestrator/llm_nodes.py :: plan_llm()
+              LLM analyzes risk event, selects tools, constructs inputs
+              Falls back to deterministic templates if LLM output is malformed
+
+  2. EXECUTE: orchestrator/nodes.py :: execute()
+              Runs tools immediately for MEDIUM+ tiers (act-first)
+              Cascade enrichment between tools, dependency tracking
+
+  3. OBSERVE: orchestrator/llm_nodes.py :: observe_llm()
+              LLM inspects actual tool results, summarizes execution quality
+
+  4. REFLECT: orchestrator/llm_nodes.py :: reflect_llm()
+              LLM checks if MANDATORY tools (per tier) succeeded
+              Only flags compliance/notification/cold_storage/insurance as gaps
+              route_agent, triage_agent, scheduling_agent are OPTIONAL
+
+  5. REVISE:  orchestrator/llm_nodes.py :: revise_llm()  (only if gaps found)
+              Proposes corrective steps for missing/failed mandatory tools
+              Hard-filters non-mandatory tools from LLM output
+
+  6. HUMAN REVIEW: graph.py :: _human_review()  (always for MEDIUM+)
+              Two states: corrections_proposed OR adequate_pending_confirmation
+
+CASCADE ENRICHMENT (_enrich_tool_input):
   compliance result  ──→  insurance_agent gets log_id as supporting_evidence
   cold_storage result ──→  notification_agent gets facility_name, advance_notice
   cold_storage result ──→  scheduling_agent gets facility, advance_notice, temp_range
@@ -145,26 +156,31 @@ CASCADE ENRICHMENT:
 | **interpret** | `nodes.py :: interpret_risk()` | Deterministic | Parses risk JSON, maps tier to severity/urgency, identifies primary issue from rule flags | `severity, urgency, primary_issue` |
 | **plan** | `llm_nodes.py :: plan_llm()` | **Agentic** (Groq) | LLM reasons about situation, selects tools, constructs inputs. GDP/FDA/WHO domain knowledge in system prompt. Token-efficient tool schemas. Falls back to deterministic if unparseable. | `draft_plan, llm_reasoning, requires_approval` |
 | **plan** | `nodes.py :: plan()` | Deterministic | Tier templates: CRITICAL→6 tools, HIGH→4, MEDIUM→2, LOW→0. Adds route_agent for air_handoff/customs. `_build_tool_input()` constructs payloads from risk_input. | `draft_plan, requires_approval` |
-| **reflect** | `llm_nodes.py :: reflect_llm()` | **Agentic** (Groq) | LLM checks plan against 6+ compliance requirements. Outputs "OK" or "GAP [name]:" notes. | `reflection_notes` |
-| **reflect** | `nodes.py :: reflect()` | Deterministic | 5-point checklist: compliance_covered, notification_included, approval_for_irreversible, has_fallback, no_empty_steps | `reflection_notes` |
-| **revise** | `llm_nodes.py :: revise_llm()` | **Agentic** (Groq) | LLM rewrites full plan + `tool_input` from draft + reflection gaps; falls back to deterministic revise if LLM disabled or malformed. | `revised_plan, active_plan, plan_revised` |
-| **revise** | `nodes.py :: revise()` | Deterministic | Keyword scan on GAP notes → inserts missing tools (compliance at pos 0, approval last, others appended). Supports: compliance, notification, insurance, cold_storage, scheduling, approval | `revised_plan, active_plan, plan_revised` |
-| **approval_gate** | `graph.py :: _approval_gate()` | Deterministic | Creates approval request and PAUSES pipeline for HIGH/CRITICAL. MEDIUM proceeds to execute. Stores proposed tools from the plan. | `requires_approval, approval_id, awaiting_approval` |
-| **execute** | `nodes.py :: execute()` | Deterministic | Sequential tool invocation with cascade enrichment; `_DEPENDS_ON`-aware warnings when upstream tools fail; `failed_tools` tracking; per-tool errors do not abort the chain. | `tool_results, execution_errors, cascade_context, approval_id` |
-| **observe** | `llm_nodes.py :: observe_llm()` | **Agentic** (Groq) | LLM inspects execution results, decides if re-planning is needed for CRITICAL failures. | `observation, needs_replan, observation_issues, observation_actions` |
+| **execute** | `nodes.py :: execute()` | Deterministic | Sequential tool invocation with cascade enrichment; `_DEPENDS_ON`-aware warnings when upstream tools fail; `failed_tools` tracking; per-tool errors do not abort the chain. **Runs immediately for MEDIUM+ tiers (act-first).** | `tool_results, execution_errors, cascade_context` |
+| **observe** | `llm_nodes.py :: observe_llm()` | **Agentic** (Groq) | LLM inspects **actual execution results**, produces observation summary. Feeds into reflect for gap analysis. | `observation, observation_issues, observation_actions` |
+| **reflect** | `llm_nodes.py :: reflect_llm()` | **Agentic** (Groq) | **Post-execution reflection**: LLM analyzes real `tool_results`, checks only **mandatory tools per tier** (CRITICAL: compliance, notification, cold_storage, insurance; MEDIUM/HIGH: compliance, notification). Explicitly ignores optional tools (route, triage). Sets `needs_revision` if mandatory tools are missing or failed. | `reflection_notes, needs_revision` |
+| **reflect** | `nodes.py :: reflect()` | Deterministic | Fallback: checks `required_tools` per tier against executed set. Only flags tools in the mandatory list. | `reflection_notes, needs_revision` |
+| **revise** | `llm_nodes.py :: revise_llm()` | **Agentic** (Groq) | **Corrective-only**: proposes steps for MISSING/FAILED mandatory tools. Hard-filters non-mandatory tools (route, triage, scheduling) from LLM output. Returns empty steps if all mandatory tools succeeded. | `revised_plan, active_plan, plan_revised` |
+| **revise** | `nodes.py :: revise()` | Deterministic | Keyword scan on GAP notes → inserts only mandatory missing tools. Skips already-succeeded tools. | `revised_plan, active_plan, plan_revised` |
+| **human_review** | `graph.py :: _human_review()` | Deterministic | **Always fires for MEDIUM+**. Creates approval request with `review_status`: `corrections_proposed` (if gaps found) or `adequate_pending_confirmation` (if first pass was sufficient). Sets `awaiting_approval=True`. | `awaiting_approval, approval_id, review_status` |
 | **fallback** | `nodes.py :: build_fallback()` | Deterministic | Minimal backup: notification_agent + compliance_agent | `fallback_plan` |
-| **output** | `nodes.py :: compile_output()` | Deterministic | Assembles final JSON with LLM reasoning, cascade context (full + 200-char summary), confidence score | `final_output, decision_summary, confidence` |
+| **output** | `nodes.py :: compile_output()` | Deterministic | Assembles final JSON with LLM reasoning, cascade context, confidence score. For MEDIUM+: always includes `awaiting_approval=True` and `review_status`. | `final_output, decision_summary, confidence, review_status` |
 
-### Conditional Edges
+### Conditional Edges (Act-First, Always-Review HITL)
 
 ```
-reflect ──→ revise          (if "GAP" found in notes AND not already revised)
-reflect ──→ approval_gate   (if plan passes all checks)
-reflect ──→ output          (if tier is LOW → skip everything)
-approval_gate ──→ execute   (MEDIUM tier: auto-execute)
-approval_gate ──→ output    (HIGH/CRITICAL: plan-only, awaiting human approval)
-observe ──→ replan_bridge   (if needs_replan=True AND replan_count < 1, CRITICAL only)
-observe ──→ fallback→output (otherwise — finalize results)
+plan ──→ output                   (LOW tier: monitoring only, no tools)
+plan ──→ execute                  (MEDIUM+ tier: act first, execute tools immediately)
+execute ──→ observe               (always)
+observe ──→ reflect               (always)
+reflect ──→ human_review          (adequate: all mandatory tools succeeded)
+reflect ──→ revise ──→ human_review (gaps: mandatory tools missing or failed)
+human_review ──→ fallback→output  (always: pipeline ends, awaiting human decision)
+
+POST-GRAPH HUMAN ACTIONS:
+  Confirm & Close     → POST /api/approvals/{id}/confirm (no re-execution)
+  Execute Corrections → POST /api/approvals/{id}/execute (run selected tools)
+  Dismiss Corrections → POST /api/approvals/{id}/execute with empty tools (confirm)
 ```
 
 ---
@@ -234,7 +250,8 @@ Compliance Agent Workflow:
 | `/api/orchestrator/history` | GET | Recent orchestrator decisions (bounded to 500) |
 | `/api/orchestrator/history` | DELETE | Clear in-memory orchestration history |
 | `/api/approvals/all` | GET | All approval requests (pending + approved + rejected) |
-| `/api/approvals/{id}/execute` | POST | Execute approved plan with human-selected tools (skips approval_workflow) |
+| `/api/approvals/{id}/execute` | POST | Execute approved plan with human-selected tools (skips approval_workflow). Empty tools list = confirm |
+| `/api/approvals/{id}/confirm` | POST | Confirm adequate first-pass execution — close review without re-execution |
 | `/api/orchestrator/mode` | GET | Current mode (agentic/deterministic) + provider + model |
 | `/api/tools/{name}/execute` | POST | Execute any agent tool directly |
 | `/api/triage/critical-shipments` | **GET** | **Auto-triage**: pull worst shipments, rank with enrichment |
@@ -277,6 +294,11 @@ Compliance Agent Workflow:
 | 19 | Deep audit & bug fixes (NaN handling, cache management, SHAP alignment, bounded history) | DONE |
 | 20 | E2E tests across all tiers (agentic + deterministic + API) | DONE |
 | 21 | Documentation (README, ARCHITECTURE, PROGRESS_REPORT) | DONE |
+| 22 | **Act-First Always-Review HITL pipeline**: rearchitected graph topology — execute first, reflect on real results, always pause for human review with two-state UI (corrections vs confirmation) | DONE |
+| 23 | **Embedded stream listener**: moved from external HTTP bridge to FastAPI lifespan — auto-scores + orchestrates MEDIUM+ tiers internally | DONE |
+| 24 | **Agentic notification integration**: Yash's LLM-driven notification subsystem with Gmail SMTP + Slack delivery | DONE |
+| 25 | **Reflect/Revise prompt hardening**: mandatory vs optional tool classification, hard-filter non-mandatory from LLM revise output, eliminated route/triage hallucinated gaps | DONE |
+| 26 | **Shipment table integration**: route_agent now joins with Supabase `shipments` table for real origin/destination | DONE |
 
 ### Karthik -- Data Pipeline & Supabase
 
@@ -286,6 +308,7 @@ Compliance Agent Workflow:
 | K2 | Supabase table setup (window_features, product_profiles, product_costs, facilities) | DONE |
 | K3 | Stream simulator (CSV replay → Supabase inserts via simulate_stream.py) | DONE |
 | K4 | Realtime listener (Supabase Realtime → POST /api/ingest HTTP bridge) | DONE |
+| K5 | Live pipeline (`gen_data/live_pipeline.py`): generate + insert new window_features rows into Supabase with Open-Meteo ambient temp + OpenSky flight delay probability | DONE |
 
 ### Mukul -- Route, Insurance, Triage Agents
 
@@ -310,6 +333,7 @@ Compliance Agent Workflow:
 | Y6 | Mock vector store fallback (6 hardcoded FDA/ICH/WHO/GDP regulations for offline use) | DONE |
 | Y7 | ComplianceLLMInterpreter for edge-case compliance (conflicting rules, borderline scenarios) | DONE |
 | Y8 | Notification agent architecture design (agentic stakeholder selection, channel strategy) | DONE |
+| Y9 | **Agentic notification subsystem**: LLM strategic planner + message composer, multi-channel (Gmail SMTP, Slack, webhook, dashboard), FDA 21 CFR Part 11 audit, stakeholder registry | DONE |
 
 ### Nikhil -- Cascade Enrichment & Context Assembler
 
@@ -338,16 +362,17 @@ Compliance Agent Workflow:
 
 | # | Issue | Severity | Status |
 |---|-------|----------|--------|
-| 6 | **Notification agent does not deliver** — builds payload but `delivered=False` | MEDIUM | Open (integrate Twilio/SendGrid) |
+| 6 | ~~**Notification agent does not deliver**~~ — now has agentic subsystem with LLM-driven stakeholder selection, Gmail SMTP delivery, Slack integration, FDA 21 CFR Part 11 audit trails. Falls back to payload-only if GROQ_API_KEY or email config missing. | MEDIUM | **Fixed** |
 | 7 | **Route geography is static** — selects by temp class, not real origin/destination | MEDIUM | Open (no origin/dest in dataset) |
 | 8 | **Streaming bridge was still pointed at old `telemetry` table** — `stream_listener.py` and `simulate_stream.py` would miss new `window_features` inserts | HIGH | Fixed |
 | 9 | **`shock_count` 99.7% zeros / `door_open_count` 99.8% zeros** in data | LOW | Open (improve data generation) |
 | 10 | **Approval workflow is in-memory** — pending approvals lost on server restart | LOW | Open (persist to Supabase) |
-| 11 | **Approval→execution gap** — ~~when operator approves, nothing happens~~ Plan-first HITL: HIGH/CRITICAL stop at `approval_gate` with plan-only output; `POST /api/approvals/{id}/execute` runs `run_orchestrator_selective` so tools run **once** after approval (no double-execution; `approval_workflow` is not part of the automated execute chain). WebSocket broadcasts `approval_executed` events. Agent Activity and Approvals tabs sync via `useWebSocket` hook. | HIGH | **Fixed** |
+| 11 | **Approval→execution gap** — ~~when operator approves, nothing happens~~ **Act-First Always-Review HITL**: MEDIUM+ tiers execute tools immediately, then reflect on real results. Every MEDIUM+ event pauses at `human_review` node. Human can Confirm (adequate) or Execute Corrections (revise proposed). `POST /api/approvals/{id}/execute` runs `run_orchestrator_selective`; `POST /api/approvals/{id}/confirm` closes without re-execution. WebSocket broadcasts events. | HIGH | **Fixed** |
 | 12 | **No human tool selection** — ~~operator can only approve/reject~~ Approvals page now has toggle buttons for each tool. Operator can select specific tools before clicking Execute. `run_orchestrator_selective()` runs only the chosen tools. | MEDIUM | **Fixed** |
 | 13 | **Execute node is fire-and-forget** — ~~runs all tools sequentially without checking~~ Execute now tracks `failed_tools` set, injects warnings into downstream tools when upstream dependencies fail (e.g. cold_storage→notification), and uses `_DEPENDS_ON` map for dependency awareness. | MEDIUM | **Fixed** |
-| 14 | **Single-iteration plan-reflect loop** — ~~graph never loops back after execution~~ Observe node (LLM-powered) inspects execution results and triggers re-plan for CRITICAL events if tools failed. Max 1 re-plan iteration to prevent infinite loops. | HIGH | **Fixed** |
-| 15 | **Revise node was keyword matching** — ~~str.find() for gap detection~~ Now `revise_llm()` sends draft plan + reflection notes + shipment context to Groq LLM, which rewrites the full plan with missing tools and correct inputs. Falls back to deterministic revise if LLM unavailable. | HIGH | **Fixed** |
+| 14 | **Single-iteration plan-reflect loop** — ~~graph never loops back after execution~~ Now uses Act-First pipeline: execute → observe → reflect → [revise]. Reflection happens on **real tool results**, not hypothetical plan. Human review always fires for MEDIUM+. | HIGH | **Fixed** |
+| 15 | **Revise node was keyword matching** — ~~str.find() for gap detection~~ Now `revise_llm()` proposes **only corrective steps** for missing/failed mandatory tools. Hard-filters non-mandatory tools (route, triage) from LLM output. Returns empty corrections if all mandatory tools succeeded. | HIGH | **Fixed** |
+| 16 | **Reflect always flagged route/triage as gaps** — LLM hallucinated missing tools. Fixed: reflect prompt now explicitly lists MANDATORY vs OPTIONAL tools per tier. route_agent and triage_agent marked as optional/situational. Both LLM and deterministic reflect constrained to mandatory-only gap detection. | HIGH | **Fixed** |
 
 ---
 
@@ -365,12 +390,13 @@ LLM is the brain, the tools are the hands. But we need to be precise about limit
 
 **What IS agentic:**
 - `plan_llm()` — LLM reasons about which tools to call and why (genuine reasoning)
-- `reflect_llm()` — LLM critiques its own plan against GDP/FDA compliance (self-correction)
-- `revise_llm()` — LLM rewrites the plan to fix all gaps from reflection (LLM plan editing)
-- `observe_llm()` — LLM inspects execution results and decides if re-planning is needed (feedback loop)
-- `_approval_gate()` — creates approval and pauses execution for human review (HITL gate)
+- `reflect_llm()` — LLM analyzes **real execution results** against mandatory compliance requirements (post-execution self-correction)
+- `revise_llm()` — LLM proposes **only corrective steps** for failed/missing mandatory tools (targeted correction, not full rewrite)
+- `observe_llm()` — LLM inspects execution results, produces quality summary (feedback loop)
+- `_human_review()` — always-review HITL gate for MEDIUM+ tiers with two-state review (corrections vs confirmation)
 - `compliance_agent` — RAG semantic search + LLM interprets real regulations (novel judgments)
 - `route_agent` — LLM evaluates trade-offs among pre-filtered safe candidates
+- `notification_agent` — **LLM-driven stakeholder selection**, message composition, multi-channel delivery (Gmail, Slack), audit trails
 
 **What is NOT agentic (and we should be honest about it):**
 - `execute()` — sequential tool invocation. Now dependency-aware (tracks `failed_tools`,
@@ -380,7 +406,6 @@ LLM is the brain, the tools are the hands. But we need to be precise about limit
 - `scheduling_agent` — feasibility checks and priority formula. Deterministic arithmetic.
 - `insurance_agent` — `unit_cost × units × spoilage_probability + disposal + handling`.
   Every number traces to product_costs.json. No intelligence.
-- `notification_agent` — assembles a dict from its inputs. Payload construction.
 - `triage_agent` — `sort(key=tier_order, then -score)`. A two-key sort.
 - `approval_workflow` — stores a dict in `_PENDING_APPROVALS`. Now supports post-approval
   execution with human tool selection, but the approval mechanism itself is a state machine.
@@ -457,19 +482,29 @@ facilities.json (or Supabase) → for each facility:
   A regulator asking "why did you pick this facility?" needs a traceable scoring formula,
   not "the LLM thought it was good."
 
-#### 4. notification_agent — DETERMINISTIC (Payload Assembly)
+#### 4. notification_agent — AGENTIC (LLM Stakeholder Selection + Multi-Channel Delivery)
 
-**How it works (code: `tools/notification_agent.py`)**:
+**How it works (code: `tools/notification_agent.py` + `tools/helper/notification/`)**:
 ```
-Inputs (risk_tier, message, recipients, channel, cascade data)
+Agentic mode (Groq available + email/Slack configured):
+  Orchestrator inputs → _map_to_agentic_input()  → rich AgenticNotificationInput
+  AgenticNotificationAgent.send_notifications():
+    Step 1: LLM Strategic Planner (Groq) → selects severity, stakeholders, channels
+    Step 2: LLM Message Composer → generates role-specific, channel-appropriate messages
+    Step 3: Multi-channel delivery: Gmail SMTP / Slack / dashboard / webhook
+    Step 4: FDA 21 CFR Part 11 audit trail generation
+  Output: notification_batch_id, successful/failed deliveries, notifications_sent[]
+
+Fallback mode (no Groq or email config):
   → Assemble alert_payload dict with revised_eta, spoilage_probability, facility_name
-  → Set requires_approval = (risk_tier in HIGH, CRITICAL)
-  → Return status: "notification_queued", delivered: false
+  → Return status: "notification_queued", message_preview, delivered: false
 ```
-- Does NOT actually send notifications — builds the payload for external delivery
+- Agentic subsystem uses LLM to determine optimal notification strategy per stakeholder role
+- Real email delivery via Gmail SMTP (GMAIL_EMAIL + GMAIL_APP_PASSWORD in .env)
+- Slack integration via SLACK_BOT_TOKEN
 - Cascade enrichment provides: facility name from cold_storage, ETA from scheduling
-- **Why deterministic is correct**: Notification content must exactly reflect the data.
-  LLM rewording risks misrepresenting spoilage probability or ETA.
+- **Agentic because**: LLM decides who to notify, via which channel, with what urgency,
+  and composes role-appropriate messages. Not template-based.
 
 #### 5. scheduling_agent — DETERMINISTIC (Feasibility + Priority Matrix)
 
@@ -557,32 +592,32 @@ decide(approval_id, decision, decided_by):
 
 ```
 GENUINELY AGENTIC (LLM reasoning, novel outputs):
-  ┌─────────────────────────────────────────────────────────┐
-  │ plan_llm()       → LLM selects tools + constructs inputs│  6 components
-  │ reflect_llm()    → LLM self-critiques against GDP/FDA   │  out of 14
-  │ revise_llm()     → LLM rewrites plan to fix reflection gaps        │
-  │ observe_llm()    → post-execution inspection + re-plan trigger  │
-  │ compliance_agent → RAG search + LLM interprets regs     │
-  │ route_agent      → LLM picks among safe candidates      │
-  └─────────────────────────────────────────────────────────┘
+  ┌───────────────────────────────────────────────────────────────┐
+  │ plan_llm()         → LLM selects tools + constructs inputs   │
+  │ reflect_llm()      → LLM post-execution gap analysis         │  8 components
+  │ revise_llm()       → LLM corrective-only plan for gaps       │  out of 14
+  │ observe_llm()      → LLM post-execution quality assessment   │
+  │ compliance_agent   → RAG search + LLM interprets regs        │
+  │ route_agent        → LLM picks among safe candidates         │
+  │ notification_agent → LLM stakeholder selection + composition  │
+  │ _human_review()    → always-review HITL gate (two-state)     │
+  └───────────────────────────────────────────────────────────────┘
 
 DETERMINISTIC (rule-based, reproducible):
-  ┌─────────────────────────────────────────────────────────┐
-  │ cold_storage_agent   → weighted scoring formula         │
-  │ scheduling_agent     → feasibility + priority formula   │  8 components
-  │ insurance_agent      → loss arithmetic from JSON costs  │  out of 14
-  │ notification_agent   → dict assembly, no decisions      │
-  │ triage_agent         → two-key sort                     │
-  │ approval_workflow    → in-memory dict store             │
-  │ execute node         → sequential for-loop + deps / failed_tools │
-  │ interpret + compile_output → tier parse + JSON assembly │
-  └─────────────────────────────────────────────────────────┘
+  ┌───────────────────────────────────────────────────────────────┐
+  │ cold_storage_agent   → weighted scoring formula              │
+  │ scheduling_agent     → feasibility + priority formula        │  6 components
+  │ insurance_agent      → loss arithmetic from JSON costs       │  out of 14
+  │ triage_agent         → two-key sort                          │
+  │ approval_workflow    → in-memory dict store                  │
+  │ execute node         → sequential for-loop + deps tracking   │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
 **This is a tool-use agent architecture** — the LLM orchestrator decides strategy,
-deterministic tools execute with precision. This pattern (ReAct / function-calling
-agent) is standard in production agentic systems. The tools don't need to be "smart"
-— the orchestrator is the brain.
+executes tools immediately, then reflects on real results. This Act-First, Always-Review
+pattern ensures: (1) immediate response to risk events, (2) post-execution self-correction,
+(3) meaningful human oversight on every MEDIUM+ event.
 
 But we should not overstate it. The system does NOT:
 - Discover or compose new tools at runtime
@@ -603,7 +638,7 @@ These are genuine improvements for future iterations.
 | 6 | **Dynamic cascade**: LLM decides what context to pass between tools | Medium | Medium | Open |
 | 7 | **cold_storage + LLM**: After scoring, LLM explains facility trade-offs | Medium | Easy | Open |
 | 8 | **insurance + LLM narrative**: Keep formula for numbers, add LLM-drafted claim narrative | Medium | Easy | Open |
-| 9 | **notification + LLM**: LLM selects stakeholders/channels based on urgency | Medium | Medium | Open |
+| 9 | ~~**notification + LLM**~~: LLM selects stakeholders/channels based on urgency | Medium | Medium | **DONE** — Yash's agentic notification subsystem integrated: Groq LLM strategic planner + message composer, Gmail SMTP + Slack delivery |
 | 10 | **triage + LLM**: LLM assesses cross-shipment dependencies | Low | Hard | Open |
 
 ---
@@ -614,8 +649,8 @@ These are genuine improvements for future iterations.
 |---|------------|--------|-----------|
 | 1 | **Populate compliance vector store** — run `ingest_compliance_docs.py` with PDFs | High | Easy |
 | 2 | ~~LLM-powered revise node~~ | ~~High~~ | ~~Medium~~ | **Done** |
-| 3 | **LLM-powered notification agent** — Yash's architecture for stakeholder/channel/escalation | High | Medium |
-| 4 | **Real-time Supabase listener in backend** — auto-subscribe to window_features changes | High | Medium |
+| 3 | ~~LLM-powered notification agent~~ | ~~High~~ | ~~Medium~~ | **Done** — agentic notification with Groq LLM + Gmail + Slack |
+| 4 | ~~Real-time Supabase listener in backend~~ | ~~High~~ | ~~Medium~~ | **Done** — embedded in FastAPI lifespan, auto-scores + orchestrates MEDIUM+ |
 | 5 | **LangSmith tracing** — full observability of LLM calls, latency, token usage | High | Easy |
 | 6 | **Dashboard LLM config panel** — UI for `/api/llm/configure` | Medium | Medium |
 | 7 | **Real routing API** — FlightAware/OpenSky for live route options | High | Hard |
@@ -629,7 +664,7 @@ These are genuine improvements for future iterations.
 
 ---
 
-## Verified E2E Test Results (April 14, 2026)
+## Verified E2E Test Results (April 16, 2026)
 
 | Test | Result |
 |------|--------|
@@ -659,6 +694,10 @@ These are genuine improvements for future iterations.
 | **Post-approval execution skips approval_workflow** | **Selective runner bypasses graph, 0 ghost approvals created, history entry replaced in-place** |
 | **Approval card reflects decided status** | **ApprovalResult shows APPROVED badge + operator name when entry is approved** |
 | **run_orchestrator_selective bypasses graph** | **Direct interpret→execute→observe→compile, no LLM plan overwrite of human selections** |
-| **Plan-first HITL (CRITICAL)** | **Plan-only output: 0 tools executed, awaiting_approval=True, 5 proposed tools, LLM reasoning captured** |
-| **Plan-first HITL (MEDIUM)** | **Auto-executed: 2 tools (compliance + notification), no approval gate, no approval_workflow tool** |
-| **Tools execute exactly once** | **CRITICAL: tools run only after human approval. No double-execution. approval_workflow removed from tool chain** |
+| **Act-First HITL (CRITICAL)** | **Tools execute immediately, reflect analyzes real results, human_review fires with review_status** |
+| **Act-First HITL (MEDIUM)** | **2 tools auto-executed (compliance + notification), reflect on results, human_review fires — confirm or correct** |
+| **Always-Review guarantee** | **Every MEDIUM+ event pauses at human_review. Two UI states: Confirm & Close vs Execute Corrections** |
+| **Reflect prompt hardening** | **Mandatory tools per tier enforced. route/triage explicitly optional. No more hallucinated gaps** |
+| **Notification agentic delivery** | **Gmail SMTP + Slack via LLM-composed messages, FDA 21 CFR Part 11 audit trail** |
+| **Embedded stream listener** | **FastAPI lifespan auto-starts Supabase subscription, scores + orchestrates MEDIUM+ internally** |
+| **POST /api/approvals/{id}/confirm** | **Confirms adequate first-pass without re-execution. review_status → "confirmed"** |

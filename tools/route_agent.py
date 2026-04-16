@@ -5,9 +5,12 @@ Selects an alternative route based on:
   - product temperature class (frozen / refrigerated / CRT)
   - preferred_mode if specified
   - reason/urgency signal
+  - real origin/destination from Supabase shipments table
 
 Reads real product data from product_profiles.json to determine the
-appropriate carrier certification class.
+appropriate carrier certification class.  When a shipments table row
+is available in Supabase, the route agent uses the actual origin and
+destination to generate context-aware LLM recommendations.
 
 Author: Mukul Ray (ray/agents-final), integrated by Rahul
 """
@@ -43,6 +46,26 @@ def _load_profiles() -> dict:
             with open(_PROFILES_PATH) as f:
                 _profiles_cache = json.load(f)
     return _profiles_cache
+
+
+def _fetch_shipment_route(shipment_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch origin, destination, mode, carrier from the Supabase shipments table."""
+    try:
+        from src.supabase_client import fetch_shipment_by_id
+        row = fetch_shipment_by_id(shipment_id)
+        if row and row.get("origin"):
+            return {
+                "origin": row.get("origin", ""),
+                "destination": row.get("destination", ""),
+                "transport_mode": row.get("transport_mode", ""),
+                "carrier": row.get("carrier", ""),
+                "ambient_temp_c": row.get("ambient_temp_c"),
+                "weather_condition": row.get("weather_condition"),
+                "flight_delay_prob": row.get("flight_delay_prob"),
+            }
+    except Exception as e:
+        logger.debug("shipment route lookup failed for %s: %s", shipment_id, e)
+    return None
 
 
 def _get_temp_class(product_id: str) -> str:
@@ -171,6 +194,7 @@ def _select_route_llm(
     preferred_mode: Optional[str],
     reason: str,
     product_id: Optional[str],
+    shipment_route: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     llm = get_llm()
     if llm is None:
@@ -190,6 +214,20 @@ def _select_route_llm(
         for i, (route, carrier, eta_delta) in enumerate(options)
     ]
 
+    route_context = ""
+    if shipment_route:
+        route_context = (
+            f"\nActual shipment route from Supabase:\n"
+            f"  Origin: {shipment_route.get('origin', 'unknown')}\n"
+            f"  Destination: {shipment_route.get('destination', 'unknown')}\n"
+            f"  Current mode: {shipment_route.get('transport_mode', 'unknown')}\n"
+            f"  Current carrier: {shipment_route.get('carrier', 'unknown')}\n"
+            f"  Ambient temp at origin: {shipment_route.get('ambient_temp_c', 'N/A')} C\n"
+            f"  Weather: {shipment_route.get('weather_condition', 'N/A')}\n"
+            f"  Flight delay probability: {shipment_route.get('flight_delay_prob', 'N/A')}\n"
+            f"Consider this real context when selecting the best reroute option.\n"
+        )
+
     prompt = (
         "You are choosing a pharmaceutical cold-chain reroute.\n"
         "Choose exactly one option from the provided candidates only.\n"
@@ -199,6 +237,7 @@ def _select_route_llm(
         f"Temperature class: {temp_class}\n"
         f"Preferred mode: {preferred_mode or 'auto'}\n"
         f"Reason: {reason}\n"
+        f"{route_context}"
         f"Options: {json.dumps(option_rows)}"
     )
 
@@ -245,7 +284,18 @@ def _execute(
     preferred_mode: Optional[str] = None,
 ) -> dict:
     temp_class = _get_temp_class(product_id) if product_id else "refrigerated"
-    route = _select_route_llm(temp_class, preferred_mode, reason, product_id)
+
+    shipment_route = _fetch_shipment_route(shipment_id)
+    if shipment_route:
+        logger.info(
+            "route_agent: real route %s → %s (mode=%s, carrier=%s)",
+            shipment_route["origin"], shipment_route["destination"],
+            shipment_route["transport_mode"], shipment_route["carrier"],
+        )
+        if not preferred_mode and shipment_route.get("transport_mode"):
+            preferred_mode = shipment_route["transport_mode"]
+
+    route = _select_route_llm(temp_class, preferred_mode, reason, product_id, shipment_route)
     if route is None:
         route = {
             **_select_route_rule_based(temp_class, preferred_mode, reason),
@@ -254,11 +304,11 @@ def _execute(
         }
 
     logger.info(
-        "route_agent: shipment=%s product=%s temp_class=%s method=%s → %s",
+        "route_agent: shipment=%s product=%s temp_class=%s method=%s -> %s",
         shipment_id, product_id, temp_class, route.get("selection_method"), route["recommended_route"],
     )
 
-    return {
+    result = {
         "tool": "route_agent",
         "status": "recommendation_generated",
         "shipment_id": shipment_id,
@@ -274,6 +324,15 @@ def _execute(
         "requires_approval": True,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
+    if shipment_route:
+        result["actual_origin"] = shipment_route["origin"]
+        result["actual_destination"] = shipment_route["destination"]
+        result["current_carrier"] = shipment_route["carrier"]
+        result["ambient_temp_c"] = shipment_route.get("ambient_temp_c")
+        result["weather_condition"] = shipment_route.get("weather_condition")
+
+    return result
 
 
 route_tool = StructuredTool.from_function(
